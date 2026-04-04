@@ -7,7 +7,6 @@ REGISTRY="$HOME/.claude/secrets-registry.json"
 
 INPUT=$(cat)
 
-# Extract tool name and input in one jq call
 PARSED=$(echo "$INPUT" | jq -r '[.tool_name // "", .tool_input.command // .tool_input.file_path // ""] | @tsv' 2>/dev/null)
 TOOL_NAME="${PARSED%%	*}"
 COMMAND="${PARSED#*	}"
@@ -21,16 +20,22 @@ deny() {
   exit 2
 }
 
-# Platform-specific secret store patterns
+# Check for secret store keywords ANYWHERE in the command string.
+# This catches direct calls, subprocess calls from Python/Ruby/Node,
+# backtick expansion, xargs, eval, and other nesting tricks.
 case "$(uname -s)" in
   Darwin)
-    [[ "$COMMAND" =~ security[[:space:]]+find-generic-password.*-w ]] && deny "Direct Keychain password read blocked."
-    [[ "$COMMAND" =~ security[[:space:]]+dump-keychain ]] && deny "Keychain dump blocked."
-    [[ "$COMMAND" =~ security[[:space:]]+export ]] && deny "Keychain export blocked."
+    [[ "$COMMAND" == *"find-generic-password"*"-w"* ]] && deny "Keychain password read blocked."
+    [[ "$COMMAND" == *"find-generic-password"*"claude-secret"* ]] && deny "Keychain read of managed secret blocked."
+    [[ "$COMMAND" == *"dump-keychain"* ]] && deny "Keychain dump blocked."
+    [[ "$COMMAND" == *"security"*"export"*"keychain"* ]] && deny "Keychain export blocked."
+    # Block any command referencing the claude-secrets service with password retrieval
+    [[ "$COMMAND" == *"claude-secrets"*"-w"* ]] && deny "Keychain read of Blindfold secrets blocked."
+    [[ "$COMMAND" == *"claude-secrets"*"password"* ]] && deny "Keychain password access blocked."
     ;;
   Linux)
-    [[ "$COMMAND" =~ secret-tool[[:space:]]+lookup.*claude-secrets ]] && deny "Direct secret-tool lookup blocked."
-    [[ "$COMMAND" =~ gpg[[:space:]]+(-d|--decrypt).*\.claude/vault/ ]] && deny "Direct GPG vault decrypt blocked."
+    [[ "$COMMAND" == *"secret-tool"*"lookup"*"claude-secrets"* ]] && deny "secret-tool lookup blocked."
+    [[ "$COMMAND" == *".claude/vault/"*".gpg"* ]] && deny "GPG vault access blocked."
     ;;
 esac
 
@@ -50,8 +55,7 @@ if [[ -f "$REGISTRY" ]]; then
     fi
 
     if [[ "$TOOL_NAME" == "Bash" && "$COMMAND" == *"$env_path"* ]]; then
-      [[ "$COMMAND" =~ (cat|head|tail|less|more|bat|view|grep|rg|awk|sed|source|\.)[[:space:]] ]] && \
-        deny "Reading registered .env file blocked."
+      deny "Access to registered .env file blocked."
     fi
   done <<< "$ENV_PATHS"
 fi
