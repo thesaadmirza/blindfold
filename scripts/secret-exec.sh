@@ -73,18 +73,23 @@ bash "$EXEC_SCRIPT" > "$STDOUT_TMP" 2> "$STDERR_TMP"
 CMD_EXIT=$?
 rm -f "$EXEC_SCRIPT"
 
-# Redact secret values from output using awk -v (safe from injection)
+# Build single-pass redaction: export secrets as env vars, awk reads them via ENVIRON
+REDACT_COUNT=0
 while IFS=$'\t' read -r label value; do
   [[ -n "$value" && ${#value} -ge $MIN_REDACT_LENGTH ]] || continue
-  for f in "$STDOUT_TMP" "$STDERR_TMP"; do
-    awk -v find="$value" -v repl="[REDACTED:${label}]" '{
-      while (idx = index($0, find)) {
-        $0 = substr($0, 1, idx-1) repl substr($0, idx + length(find))
-      }
-      print
-    }' "$f" > "${f}.redacted" && mv "${f}.redacted" "$f"
-  done
+  export "__REDACT_F_${REDACT_COUNT}=${value}"
+  export "__REDACT_R_${REDACT_COUNT}=[REDACTED:${label}]"
+  REDACT_COUNT=$((REDACT_COUNT + 1))
 done < "$REDACT_FILE"
+
+if [[ $REDACT_COUNT -gt 0 ]]; then
+  AWK_SCRIPT='{ for (i = 0; i < n; i++) { f = ENVIRON["__REDACT_F_" i]; r = ENVIRON["__REDACT_R_" i]; while (idx = index($0, f)) { $0 = substr($0, 1, idx-1) r substr($0, idx + length(f)) } } print }'
+  for f in "$STDOUT_TMP" "$STDERR_TMP"; do
+    awk -v n="$REDACT_COUNT" "$AWK_SCRIPT" "$f" > "${f}.redacted" && mv "${f}.redacted" "$f"
+  done
+  # Clean up env vars
+  for ((i=0; i<REDACT_COUNT; i++)); do unset "__REDACT_F_${i}" "__REDACT_R_${i}"; done
+fi
 
 STDOUT_CONTENT=$(cat "$STDOUT_TMP")
 STDERR_CONTENT=$(cat "$STDERR_TMP")
