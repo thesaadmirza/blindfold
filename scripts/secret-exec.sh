@@ -68,8 +68,8 @@ fi
 
 echo "$RESOLVED_CMD" >> "$EXEC_SCRIPT"
 
-# Execute
-bash "$EXEC_SCRIPT" > "$STDOUT_TMP" 2> "$STDERR_TMP"
+# Execute (sandboxed on macOS to prevent the inner command from reaching the keychain)
+run_sandboxed bash "$EXEC_SCRIPT" > "$STDOUT_TMP" 2> "$STDERR_TMP"
 CMD_EXIT=$?
 rm -f "$EXEC_SCRIPT"
 
