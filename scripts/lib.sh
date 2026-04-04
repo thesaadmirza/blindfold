@@ -10,6 +10,36 @@ MIN_REDACT_LENGTH=4
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
+_SV_SANDBOX_PROFILE=""
+
+has_sandbox() {
+  case "$(uname -s)" in
+    Darwin) command -v sandbox-exec &>/dev/null ;;
+    Linux) command -v bwrap &>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+get_sandbox_profile() {
+  if [[ -n "$_SV_SANDBOX_PROFILE" ]]; then
+    echo "$_SV_SANDBOX_PROFILE"
+    return
+  fi
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _SV_SANDBOX_PROFILE="${script_dir}/sandbox.sb"
+  echo "$_SV_SANDBOX_PROFILE"
+}
+
+run_sandboxed() {
+  local profile
+  profile=$(get_sandbox_profile)
+  if [[ "$(uname -s)" == "Darwin" && -f "$profile" ]]; then
+    sandbox-exec -f "$profile" "$@"
+  else
+    "$@"
+  fi
+}
 
 check_dependencies() {
   if ! command -v jq &>/dev/null; then
