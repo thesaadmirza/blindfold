@@ -2,16 +2,29 @@
 # Shared functions for Blindfold scripts.
 # Source this file: source "$(dirname "$0")/lib.sh"
 
-REGISTRY="$HOME/.claude/secrets-registry.json"
+REGISTRY="${BLINDFOLD_REGISTRY:-$HOME/.claude/secrets-registry.json}"
 SERVICE="claude-secrets"
 ACCOUNT_PREFIX="claude-secret"
 MIN_REDACT_LENGTH=4
+BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-$HOME/Library/Keychains/blindfold.keychain-db}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
 _SV_SANDBOX_PROFILE=""
 _SV_PLATFORM=""
+
+ensure_keychain() {
+  # Create the Blindfold keychain if it doesn't exist (macOS only)
+  [[ "$(get_platform)" == "Darwin" ]] || return 0
+  if [[ ! -f "$BLINDFOLD_KEYCHAIN" ]]; then
+    security create-keychain -p "" "$BLINDFOLD_KEYCHAIN" 2>/dev/null
+    # No auto-lock timeout
+    security set-keychain-settings "$BLINDFOLD_KEYCHAIN" 2>/dev/null
+  fi
+  # Ensure unlocked (idempotent)
+  security unlock-keychain -p "" "$BLINDFOLD_KEYCHAIN" 2>/dev/null
+}
 
 get_platform() {
   if [[ -z "$_SV_PLATFORM" ]]; then
@@ -106,7 +119,8 @@ get_secret() {
 
   case "$backend" in
     keychain)
-      security find-generic-password -a "$account" -s "$SERVICE" -w 2>/dev/null
+      ensure_keychain
+      security find-generic-password -a "$account" -s "$SERVICE" -w "$BLINDFOLD_KEYCHAIN" 2>/dev/null
       ;;
     secret-tool)
       secret-tool lookup service "$SERVICE" account "$account" 2>/dev/null
@@ -136,10 +150,11 @@ store_secret() {
 
   case "$backend" in
     keychain)
+      ensure_keychain
       # Note: -w passes the value as a CLI arg, briefly visible in ps. macOS security
       # command does not support stdin for -w. The exposure window is very short.
-      security add-generic-password -a "$account" -s "$SERVICE" -U -w "$value" 2>/dev/null ||
-      security add-generic-password -a "$account" -s "$SERVICE" -w "$value" 2>/dev/null
+      security add-generic-password -a "$account" -s "$SERVICE" -U -w "$value" "$BLINDFOLD_KEYCHAIN" 2>/dev/null ||
+      security add-generic-password -a "$account" -s "$SERVICE" -w "$value" "$BLINDFOLD_KEYCHAIN" 2>/dev/null
       ;;
     secret-tool)
       echo -n "$value" | secret-tool store --label="$account" service "$SERVICE" account "$account" 2>/dev/null
@@ -167,7 +182,7 @@ delete_secret() {
   backend=$(detect_backend)
 
   case "$backend" in
-    keychain) security delete-generic-password -a "$account" -s "$SERVICE" >/dev/null 2>&1 || true ;;
+    keychain) ensure_keychain; security delete-generic-password -a "$account" -s "$SERVICE" "$BLINDFOLD_KEYCHAIN" >/dev/null 2>&1 || true ;;
     secret-tool) secret-tool clear service "$SERVICE" account "$account" 2>/dev/null || true ;;
     gpg) rm -f "$HOME/.claude/vault/$(echo "$account" | tr '/:' '__').gpg" 2>/dev/null || true ;;
     wincred) cmdkey "/delete:${account}" >/dev/null 2>&1 || true ;;
@@ -180,7 +195,7 @@ secret_exists() {
   backend=$(detect_backend)
 
   case "$backend" in
-    keychain) security find-generic-password -a "$account" -s "$SERVICE" >/dev/null 2>&1 ;;
+    keychain) ensure_keychain; security find-generic-password -a "$account" -s "$SERVICE" "$BLINDFOLD_KEYCHAIN" >/dev/null 2>&1 ;;
     secret-tool) secret-tool lookup service "$SERVICE" account "$account" >/dev/null 2>&1 ;;
     gpg) [[ -f "$HOME/.claude/vault/$(echo "$account" | tr '/:' '__').gpg" ]] ;;
     wincred) cmdkey "/list:${account}" >/dev/null 2>&1 ;;
