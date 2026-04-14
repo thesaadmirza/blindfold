@@ -6,7 +6,7 @@ REGISTRY="$HOME/.claude/secrets-registry.json"
 
 INPUT=$(</dev/stdin)
 
-PARSED=$(jq -r '[.tool_name // "", .tool_result.stdout // .tool_result // ""] | @tsv' <<< "$INPUT" 2>/dev/null)
+PARSED=$(jq -r '[.tool_name // "", .tool_response.stdout // .tool_response // ""] | @tsv' <<< "$INPUT" 2>/dev/null)
 TOOL_NAME="${PARSED%%	*}"
 TOOL_RESULT="${PARSED#*	}"
 
