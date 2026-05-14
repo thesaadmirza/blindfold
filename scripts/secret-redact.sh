@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# PostToolUse hook: scans Bash output for leaked secret values.
+# PostToolUse hook: scans Bash output for leaked secret values and
+# replaces them with [REDACTED:NAME] before Claude sees the result.
 set -uo pipefail
 
-REGISTRY="$HOME/.claude/secrets-registry.json"
+SCRIPT_DIR="$(dirname "$0")"
+[[ -f "$SCRIPT_DIR/lib.sh" ]] && source "$SCRIPT_DIR/lib.sh" || exit 0
 
 INPUT=$(</dev/stdin)
 
@@ -19,9 +21,9 @@ SECRET_COUNT=$(jq '(.global.secrets | length) + ([.projects | to_entries[]? | .v
 # Skip if output came from secret-exec.sh (already redacted)
 [[ "$TOOL_RESULT" != *"[REDACTED:"* ]] || exit 0
 
-SCRIPT_DIR="$(dirname "$0")"
-[[ -f "$SCRIPT_DIR/lib.sh" ]] && source "$SCRIPT_DIR/lib.sh" || exit 0
+check_dependencies
 
+REDACTED_RESULT="$TOOL_RESULT"
 LEAKED_NAMES=()
 PROJECT_PATH=$(get_project_path)
 
@@ -35,7 +37,11 @@ while IFS= read -r name; do
   for scope in "$PROJECT_PATH" "global"; do
     value=$(get_secret "$(make_account_key "$scope" "$name")")
     if [[ -n "$value" && ${#value} -ge $MIN_REDACT_LENGTH ]]; then
-      [[ "$TOOL_RESULT" == *"$value"* ]] && LEAKED_NAMES+=("$name")
+      if [[ "$REDACTED_RESULT" == *"$value"* ]]; then
+        LEAKED_NAMES+=("$name")
+        # Replace all occurrences of the secret value
+        REDACTED_RESULT="${REDACTED_RESULT//"$value"/"[REDACTED:${name}]"}"
+      fi
       break
     fi
   done
@@ -43,7 +49,13 @@ done <<< "$ALL_SECRETS"
 
 if [[ ${#LEAKED_NAMES[@]} -gt 0 ]]; then
   NAMES_STR=$(IFS=', '; echo "${LEAKED_NAMES[*]}")
-  jq -n --arg msg "WARNING: Secret values detected in output for: ${NAMES_STR}. DO NOT reference or repeat these values." \
+
+  # Emit the scrubbed result so Claude sees redacted output
+  jq -n --arg result "$REDACTED_RESULT" \
+    '{"tool_response": {"stdout": $result}}'
+
+  # Also warn Claude not to reference the values
+  jq -n --arg msg "WARNING: Secret values for [${NAMES_STR}] were redacted from output. Do not attempt to recover or reference the original values." \
     '{"systemMessage": $msg}' >&2
 fi
 

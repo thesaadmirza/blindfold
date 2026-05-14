@@ -17,7 +17,9 @@ done
 
 PROJECT_PATH=$(get_project_path)
 
-# Secure temp files (600 permissions, cleaned up on exit)
+# Secure temp files (600 permissions, cleaned up on exit and signals)
+# Note: SIGKILL (kill -9) cannot be trapped — temp files may persist.
+# Mitigations: restrictive permissions (600) and umask 077 limit exposure.
 OLD_UMASK=$(umask)
 umask 077
 REDACT_FILE=$(mktemp)
@@ -25,7 +27,17 @@ EXEC_SCRIPT=$(mktemp)
 STDOUT_TMP=$(mktemp)
 STDERR_TMP=$(mktemp)
 umask "$OLD_UMASK"
-trap 'rm -f "$REDACT_FILE" "$EXEC_SCRIPT" "$STDOUT_TMP" "$STDERR_TMP" 2>/dev/null' EXIT
+chmod 600 "$REDACT_FILE" "$EXEC_SCRIPT" "$STDOUT_TMP" "$STDERR_TMP"
+
+CHILD_PID=""
+cleanup_temp_files() {
+  [[ -n "$CHILD_PID" ]] && kill "$CHILD_PID" 2>/dev/null
+  rm -f "$REDACT_FILE" "$EXEC_SCRIPT" "$STDOUT_TMP" "$STDERR_TMP" 2>/dev/null
+}
+trap cleanup_temp_files EXIT
+trap 'cleanup_temp_files; exit 143' SIGTERM
+trap 'cleanup_temp_files; exit 130' SIGINT
+trap 'cleanup_temp_files; exit 129' SIGHUP
 
 echo '#!/usr/bin/env bash' > "$EXEC_SCRIPT"
 
@@ -50,8 +62,11 @@ done <<< "$PLACEHOLDERS"
 echo "$RESOLVED_CMD" >> "$EXEC_SCRIPT"
 
 # Execute (sandboxed on macOS to prevent the inner command from reaching the keychain)
-run_sandboxed bash "$EXEC_SCRIPT" > "$STDOUT_TMP" 2> "$STDERR_TMP"
+run_sandboxed bash "$EXEC_SCRIPT" > "$STDOUT_TMP" 2> "$STDERR_TMP" &
+CHILD_PID=$!
+wait "$CHILD_PID"
 CMD_EXIT=$?
+CHILD_PID=""
 rm -f "$EXEC_SCRIPT"
 
 # Single-pass redaction via ENVIRON
