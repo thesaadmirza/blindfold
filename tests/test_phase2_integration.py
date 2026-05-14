@@ -291,11 +291,11 @@ class TestSecretExecPlaceholder:
 
 @macos_only
 class TestRedactHookFiresOnLeak:
-    """2.7 — PostToolUse hook redacts leaked values from Bash output.
+    """2.7 — PostToolUse hook detects leaked values in Bash output.
 
     This complements test_redaction.py by exercising the full scenario
     from the manual test (a Bash command echoes a stored secret value
-    verbatim, and the hook scrubs it before Claude sees the result).
+    verbatim, and the hook warns Claude via systemMessage).
     """
 
     @pytest.fixture(autouse=True)
@@ -326,23 +326,22 @@ class TestRedactHookFiresOnLeak:
             capture_output=True,
         )
 
-    def test_leaked_value_is_redacted_from_output(self):
-        """If Bash output contains a stored secret, the hook must scrub it."""
-        # Simulate the manual test scenario: `echo <secret>` produced the raw value
+    def test_leaked_value_triggers_system_message(self):
+        """If Bash output contains a stored secret, the hook must warn Claude."""
         hook_input = build_redact_input(self.secret_value)
         result = _run_redact(hook_input, self.env)
 
         assert result.returncode == 0
 
-        # Hook should have emitted a tool_response with the value redacted
-        payload = json.loads(result.stdout)
-        assert "tool_response" in payload, (
-            "Hook must emit tool_response (regression guard for issue #2)"
+        # Hook should emit systemMessage on stderr (not tool_response on stdout)
+        payload = json.loads(result.stderr)
+        assert "systemMessage" in payload, (
+            "Hook must emit systemMessage warning when leak detected"
         )
-        redacted_stdout = payload["tool_response"]["stdout"]
-        assert self.secret_value not in redacted_stdout, (
-            "Secret value must not appear in redacted output"
+        assert self.secret_name in payload["systemMessage"], (
+            f"Warning must name the leaked secret ({self.secret_name})"
         )
-        assert f"[REDACTED:{self.secret_name}]" in redacted_stdout, (
-            "Redacted output must contain the placeholder marker"
+        # stdout should be empty (tool_response dropped)
+        assert result.stdout.strip() == "", (
+            "Hook should not emit tool_response on stdout"
         )

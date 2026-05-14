@@ -6,7 +6,8 @@ REGISTRY="${BLINDFOLD_REGISTRY:-$HOME/.claude/secrets-registry.json}"
 SERVICE="claude-secrets"
 ACCOUNT_PREFIX="claude-secret"
 MIN_REDACT_LENGTH=4
-BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-$HOME/Library/Keychains/blindfold.keychain-db}"
+# Default to login keychain. Set BLINDFOLD_KEYCHAIN to use a dedicated keychain.
+BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
@@ -14,9 +15,16 @@ _SV_PROJECT_PATH=""
 _SV_SANDBOX_PROFILE=""
 _SV_PLATFORM=""
 
+# Returns the keychain path arg for security commands, or empty if using login keychain.
+_keychain_arg() {
+  [[ -n "$BLINDFOLD_KEYCHAIN" ]] && echo "$BLINDFOLD_KEYCHAIN" || true
+}
+
 ensure_keychain() {
-  # Create the Blindfold keychain if it doesn't exist (macOS only)
+  # If using a dedicated keychain, create it if needed (macOS only).
+  # If BLINDFOLD_KEYCHAIN is unset, the login keychain is used and no setup is needed.
   [[ "$(get_platform)" == "Darwin" ]] || return 0
+  [[ -n "$BLINDFOLD_KEYCHAIN" ]] || return 0
   if [[ ! -f "$BLINDFOLD_KEYCHAIN" ]]; then
     security create-keychain -p "" "$BLINDFOLD_KEYCHAIN" 2>/dev/null
     # No auto-lock timeout
@@ -120,7 +128,7 @@ get_secret() {
   case "$backend" in
     keychain)
       ensure_keychain
-      security find-generic-password -a "$account" -s "$SERVICE" -w "$BLINDFOLD_KEYCHAIN" 2>/dev/null
+      security find-generic-password -a "$account" -s "$SERVICE" -w $(_keychain_arg) 2>/dev/null
       ;;
     secret-tool)
       secret-tool lookup service "$SERVICE" account "$account" 2>/dev/null
@@ -153,8 +161,8 @@ store_secret() {
       ensure_keychain
       # Note: -w passes the value as a CLI arg, briefly visible in ps. macOS security
       # command does not support stdin for -w. The exposure window is very short.
-      security add-generic-password -a "$account" -s "$SERVICE" -U -w "$value" "$BLINDFOLD_KEYCHAIN" 2>/dev/null ||
-      security add-generic-password -a "$account" -s "$SERVICE" -w "$value" "$BLINDFOLD_KEYCHAIN" 2>/dev/null
+      security add-generic-password -a "$account" -s "$SERVICE" -U -w "$value" $(_keychain_arg) 2>/dev/null ||
+      security add-generic-password -a "$account" -s "$SERVICE" -w "$value" $(_keychain_arg) 2>/dev/null
       ;;
     secret-tool)
       echo -n "$value" | secret-tool store --label="$account" service "$SERVICE" account "$account" 2>/dev/null
@@ -182,7 +190,7 @@ delete_secret() {
   backend=$(detect_backend)
 
   case "$backend" in
-    keychain) ensure_keychain; security delete-generic-password -a "$account" -s "$SERVICE" "$BLINDFOLD_KEYCHAIN" >/dev/null 2>&1 || true ;;
+    keychain) ensure_keychain; security delete-generic-password -a "$account" -s "$SERVICE" $(_keychain_arg) >/dev/null 2>&1 || true ;;
     secret-tool) secret-tool clear service "$SERVICE" account "$account" 2>/dev/null || true ;;
     gpg) rm -f "$HOME/.claude/vault/$(echo "$account" | tr '/:' '__').gpg" 2>/dev/null || true ;;
     wincred) cmdkey "/delete:${account}" >/dev/null 2>&1 || true ;;
@@ -195,7 +203,7 @@ secret_exists() {
   backend=$(detect_backend)
 
   case "$backend" in
-    keychain) ensure_keychain; security find-generic-password -a "$account" -s "$SERVICE" "$BLINDFOLD_KEYCHAIN" >/dev/null 2>&1 ;;
+    keychain) ensure_keychain; security find-generic-password -a "$account" -s "$SERVICE" $(_keychain_arg) >/dev/null 2>&1 ;;
     secret-tool) secret-tool lookup service "$SERVICE" account "$account" >/dev/null 2>&1 ;;
     gpg) [[ -f "$HOME/.claude/vault/$(echo "$account" | tr '/:' '__').gpg" ]] ;;
     wincred) cmdkey "/list:${account}" >/dev/null 2>&1 ;;

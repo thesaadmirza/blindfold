@@ -1,12 +1,9 @@
-"""Tests for output redaction in the PostToolUse hook.
+"""Tests for leak detection in the PostToolUse hook.
 
 The PostToolUse hook (secret-redact.sh) runs after every Bash command
-and replaces any leaked secret values with [REDACTED:NAME] in the
-output before Claude sees it.
-
-These tests verify that redaction actually replaces the values and
-that the emitted JSON uses the correct `tool_response` key (regression
-for issue #2, where the hook was silently reading the wrong field).
+and warns Claude via systemMessage if any secret values appear in the
+output. Claude Code does not support output replacement for built-in
+tools, so the hook detects and warns rather than scrubs.
 """
 
 import json
@@ -33,8 +30,8 @@ def _run_redact_hook(hook_input: str, env: dict) -> subprocess.CompletedProcess:
 
 
 @macos_only
-class TestRedactionActuallyRedacts:
-    """Verify that the PostToolUse hook replaces leaked values, not just warns."""
+class TestLeakDetection:
+    """Verify that the PostToolUse hook detects leaked values and warns Claude."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, env_with_registry, temp_registry, temp_keychain):
@@ -70,60 +67,60 @@ class TestRedactionActuallyRedacts:
             capture_output=True,
         )
 
-    def test_leaked_secret_is_replaced_in_output(self):
-        """If a secret value appears in Bash output, it must be replaced."""
+    def test_leaked_secret_triggers_warning(self):
+        """If a secret value appears in Bash output, a systemMessage warning must be emitted."""
         hook_input = build_redact_input(
             f"Response from API: token={self.secret_value} status=200"
         )
         result = _run_redact_hook(hook_input, self.env)
 
-        # The hook emits a modified tool_response with the value replaced
-        assert self.secret_value not in result.stdout, (
-            "Secret value was NOT redacted from stdout"
+        # The hook emits a systemMessage on stderr warning Claude
+        assert "WARNING" in result.stderr, (
+            "Hook must emit a systemMessage warning when a secret is detected"
+        )
+        assert self.secret_name in result.stderr, (
+            f"Warning must name the leaked secret ({self.secret_name})"
         )
 
-    def test_hook_emits_tool_response_not_tool_result(self):
-        """Regression for #2: emitted JSON must use tool_response key.
+    def test_hook_emits_system_message_not_tool_response(self):
+        """Hook must emit systemMessage on stderr, not tool_response on stdout.
 
-        The field name must match Claude Code's hook schema (tool_response).
-        If a future change reverts to tool_result, the hook will silently
-        fail because the stdout will never flow back to Claude Code.
+        Claude Code ignores tool_response stdout from PostToolUse hooks
+        for built-in tools. The only effective channel is systemMessage.
         """
         hook_input = build_redact_input(f"leak={self.secret_value}")
         result = _run_redact_hook(hook_input, self.env)
 
-        # Parse stdout as JSON — hook should emit a tool_response object
-        payload = json.loads(result.stdout)
-        assert "tool_response" in payload, (
-            "Hook output must use tool_response key to match Claude Code schema"
+        # stderr should contain a valid systemMessage JSON
+        payload = json.loads(result.stderr)
+        assert "systemMessage" in payload, (
+            "Hook must emit systemMessage on stderr"
         )
-        assert "tool_result" not in payload, (
-            "tool_result is the wrong field name (regression for #2)"
+        # stdout should be empty (no tool_response emission)
+        assert result.stdout.strip() == "", (
+            "Hook should not emit tool_response on stdout (ignored by Claude Code)"
         )
 
-    def test_redacted_output_contains_placeholder(self):
-        """Redacted output should show [REDACTED:NAME] instead of the value."""
+    def test_warning_names_leaked_secret(self):
+        """Warning message should identify which secret was detected."""
         hook_input = build_redact_input(
             f"key={self.secret_value}"
         )
         result = _run_redact_hook(hook_input, self.env)
 
-        # Should contain the redaction marker
-        combined = result.stdout + result.stderr
-        assert f"[REDACTED:{self.secret_name}]" in combined, (
-            "Expected [REDACTED:BFTEST_REDACT] in output but not found"
+        assert self.secret_name in result.stderr, (
+            f"Expected secret name {self.secret_name} in warning but not found"
         )
 
-    def test_multiple_occurrences_all_redacted(self):
-        """Every occurrence of the secret in output should be replaced."""
+    def test_multiple_occurrences_detected(self):
+        """Multiple occurrences of a secret should still trigger the warning."""
         hook_input = build_redact_input(
             f"first={self.secret_value} middle=ok last={self.secret_value}"
         )
         result = _run_redact_hook(hook_input, self.env)
 
-        combined = result.stdout + result.stderr
-        assert self.secret_value not in combined, (
-            "Secret value still present after redaction"
+        assert "WARNING" in result.stderr, (
+            "Hook must warn even with multiple occurrences"
         )
 
     def test_non_bash_tool_is_ignored(self):
@@ -137,7 +134,7 @@ class TestRedactionActuallyRedacts:
         assert result.returncode == 0
 
     def test_output_without_secrets_passes_through(self):
-        """Output that doesn't contain secrets should not be modified."""
+        """Output that doesn't contain secrets should not trigger a warning."""
         hook_input = build_redact_input("normal output with no secrets")
         result = _run_redact_hook(hook_input, self.env)
         assert result.returncode == 0

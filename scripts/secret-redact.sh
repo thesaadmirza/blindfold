@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # PostToolUse hook: scans Bash output for leaked secret values and
-# replaces them with [REDACTED:NAME] before Claude sees the result.
+# warns Claude via systemMessage to disregard them.
+# Note: Claude Code does not support output replacement for built-in tools.
+# The tool_response emission is silently ignored, so we rely on systemMessage.
 set -uo pipefail
 
 SCRIPT_DIR="$(dirname "$0")"
@@ -40,7 +42,8 @@ while IFS= read -r name; do
       if [[ "$REDACTED_RESULT" == *"$value"* ]]; then
         LEAKED_NAMES+=("$name")
         # Replace all occurrences of the secret value
-        REDACTED_RESULT="${REDACTED_RESULT//"$value"/"[REDACTED:${name}]"}"
+        repl="[REDACTED:${name}]"
+        REDACTED_RESULT="${REDACTED_RESULT//"$value"/$repl}"
       fi
       break
     fi
@@ -50,12 +53,10 @@ done <<< "$ALL_SECRETS"
 if [[ ${#LEAKED_NAMES[@]} -gt 0 ]]; then
   NAMES_STR=$(IFS=', '; echo "${LEAKED_NAMES[*]}")
 
-  # Emit the scrubbed result so Claude sees redacted output
-  jq -n --arg result "$REDACTED_RESULT" \
-    '{"tool_response": {"stdout": $result}}'
-
-  # Also warn Claude not to reference the values
-  jq -n --arg msg "WARNING: Secret values for [${NAMES_STR}] were redacted from output. Do not attempt to recover or reference the original values." \
+  # Warn Claude not to reference the leaked values.
+  # This is the only effective output channel — Claude Code ignores
+  # tool_response stdout from PostToolUse hooks for built-in tools.
+  jq -n --arg msg "WARNING: Secret values for [${NAMES_STR}] were detected in command output. The raw values may appear in context. Do not store, repeat, or reference them." \
     '{"systemMessage": $msg}' >&2
 fi
 
