@@ -9,9 +9,9 @@ SANDBOX_PROFILE="${SCRIPT_DIR}/sandbox.sb"
 
 INPUT=$(</dev/stdin)
 
-PARSED=$(jq -r '[.tool_name // "", .tool_input.command // ""] | @tsv' <<< "$INPUT" 2>/dev/null)
-TOOL_NAME="${PARSED%%	*}"
-COMMAND="${PARSED#*	}"
+# Read each field on its own: @tsv would turn real newlines into a literal \n
+TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
+COMMAND=$(jq -r '.tool_input.command // ""' <<< "$INPUT" 2>/dev/null)
 
 [[ "$TOOL_NAME" == "Bash" ]] || exit 0
 [[ -n "$COMMAND" ]] || exit 0
@@ -20,6 +20,12 @@ deny() {
   echo "DENIED by Blindfold: $1" >&2
   echo "Use secret-exec.sh to run commands that need secrets." >&2
   exit 2
+}
+
+# Wrap a string in single quotes. Uses sed because bash 3.2, the macOS
+# default, keeps the backslashes in a ${var//\'/...} replacement.
+single_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
 # Exempt Blindfold's own scripts -- must match at start, followed by space or end-of-string
@@ -36,8 +42,7 @@ done
 
 # On macOS with Seatbelt: wrap the command in sandbox-exec
 if [[ "$OSTYPE" == darwin* && -f "$SANDBOX_PROFILE" ]] && command -v sandbox-exec &>/dev/null; then
-  ESCAPED_CMD="${COMMAND//\'/\'\\\'\'}"
-  WRAPPED="sandbox-exec -f '${SANDBOX_PROFILE}' bash -c '${ESCAPED_CMD}'"
+  WRAPPED="sandbox-exec -f $(single_quote "$SANDBOX_PROFILE") bash -c $(single_quote "$COMMAND")"
 
   jq -n --arg cmd "$WRAPPED" '{
     hookSpecificOutput: {

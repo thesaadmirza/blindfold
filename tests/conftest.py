@@ -139,8 +139,8 @@ def run_script(script_name: str, args: list[str] | None = None,
 def build_guard_input(command: str, tool_name: str = "Bash") -> str:
     """Build PreToolUse hook input JSON (for secret-guard.sh).
 
-    Schema verified against `scripts/secret-guard.sh:12`:
-        jq -r '[.tool_name // "", .tool_input.command // ""] | @tsv'
+    Schema verified against `scripts/secret-guard.sh`, which reads
+    `.tool_name` and `.tool_input.command`.
     """
     return json.dumps({
         "tool_name": tool_name,
@@ -148,6 +148,43 @@ def build_guard_input(command: str, tool_name: str = "Bash") -> str:
             "command": command,
         },
     })
+
+
+def run_guard(hook_input: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run secret-guard.sh with the given hook input on stdin."""
+    return subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "secret-guard.sh")],
+        input=hook_input,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+
+def wrapped_command(guard_stdout: str) -> str | None:
+    """Parse guard stdout and extract the sandboxed command.
+
+    On macOS with sandbox-exec available, the guard emits a
+    hookSpecificOutput JSON with `updatedInput.command` set to the
+    wrapped command. Returns None if the guard didn't emit JSON
+    (e.g., exempt command, or non-macOS fallback path).
+    """
+    try:
+        payload = json.loads(guard_stdout)
+        return payload["hookSpecificOutput"]["updatedInput"]["command"]
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def execute_wrapped(wrapped_cmd: str) -> subprocess.CompletedProcess:
+    """Execute a sandbox-wrapped command string."""
+    return subprocess.run(
+        ["bash", "-c", wrapped_cmd],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
 
 
 def build_redact_input(stdout: str, tool_name: str = "Bash") -> str:
