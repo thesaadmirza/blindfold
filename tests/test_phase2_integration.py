@@ -30,8 +30,11 @@ import pytest
 from conftest import (
     build_guard_input,
     build_redact_input,
+    execute_wrapped,
     macos_only,
+    run_guard,
     run_script,
+    wrapped_command,
     SCRIPTS_DIR,
 )
 
@@ -39,18 +42,6 @@ from conftest import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _run_guard(hook_input: str, env: dict) -> subprocess.CompletedProcess:
-    """Run secret-guard.sh with the given hook input on stdin."""
-    return subprocess.run(
-        ["bash", str(SCRIPTS_DIR / "secret-guard.sh")],
-        input=hook_input,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-
 
 def _run_redact(hook_input: str, env: dict) -> subprocess.CompletedProcess:
     """Run secret-redact.sh with the given hook input on stdin."""
@@ -60,31 +51,6 @@ def _run_redact(hook_input: str, env: dict) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         env=env,
-        timeout=10,
-    )
-
-
-def _extract_wrapped_command(guard_stdout: str) -> str | None:
-    """Parse guard stdout and extract the sandboxed command.
-
-    On macOS with sandbox-exec available, the guard emits a
-    hookSpecificOutput JSON with `updatedInput.command` set to the
-    wrapped command. Returns None if the guard didn't emit JSON
-    (e.g., exempt command, or non-macOS fallback path).
-    """
-    try:
-        payload = json.loads(guard_stdout)
-        return payload["hookSpecificOutput"]["updatedInput"]["command"]
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-
-def _execute_wrapped(wrapped_cmd: str) -> subprocess.CompletedProcess:
-    """Execute a sandbox-wrapped command string."""
-    return subprocess.run(
-        ["bash", "-c", wrapped_cmd],
-        capture_output=True,
-        text=True,
         timeout=10,
     )
 
@@ -100,7 +66,7 @@ class TestGuardHookBasics:
     def test_guard_wraps_benign_command(self, env_with_registry):
         """Guard emits hookSpecificOutput JSON with command wrapped in sandbox-exec."""
         hook_input = build_guard_input("echo hook test")
-        result = _run_guard(hook_input, env_with_registry)
+        result = run_guard(hook_input, env_with_registry)
 
         assert result.returncode == 0, (
             f"Guard should exit 0 on benign command, got {result.returncode}. "
@@ -108,7 +74,7 @@ class TestGuardHookBasics:
         )
         assert result.stdout.strip(), "Guard should emit JSON on stdout"
 
-        wrapped = _extract_wrapped_command(result.stdout)
+        wrapped = wrapped_command(result.stdout)
         assert wrapped is not None, (
             f"Guard output missing hookSpecificOutput: {result.stdout}"
         )
@@ -120,12 +86,12 @@ class TestGuardHookBasics:
         )
 
     def test_guard_ignores_non_bash_tools(self, env_with_registry):
-        """Guard should exit 0 silently for non-Bash tools."""
+        """Guard should exit 0 silently for tools it does not handle."""
         hook_input = json.dumps({
-            "tool_name": "Read",
-            "tool_input": {"file_path": "/tmp/foo"},
+            "tool_name": "Glob",
+            "tool_input": {"pattern": "*.py"},
         })
-        result = _run_guard(hook_input, env_with_registry)
+        result = run_guard(hook_input, env_with_registry)
 
         assert result.returncode == 0
         assert result.stdout.strip() == "", (
@@ -136,7 +102,7 @@ class TestGuardHookBasics:
         """Commands invoking blindfold's own scripts should pass through without wrapping."""
         exec_path = str(SCRIPTS_DIR / "secret-exec.sh")
         hook_input = build_guard_input(f"bash {exec_path} 'echo hi'")
-        result = _run_guard(hook_input, env_with_registry)
+        result = run_guard(hook_input, env_with_registry)
 
         assert result.returncode == 0
         # Exempt commands exit 0 with no JSON output
@@ -160,15 +126,15 @@ class TestSandboxBlocksKeychainRead:
             "security find-generic-password -a claude-secret:global:BFTEST_BLOCK "
             "-s claude-secrets -w"
         )
-        guard_result = _run_guard(hook_input, env_with_registry)
+        guard_result = run_guard(hook_input, env_with_registry)
         assert guard_result.returncode == 0, "Guard wraps, doesn't deny directly"
 
-        wrapped = _extract_wrapped_command(guard_result.stdout)
+        wrapped = wrapped_command(guard_result.stdout)
         assert wrapped is not None, "Guard should emit wrapped command"
         assert "sandbox-exec" in wrapped
 
         # Execute the sandbox-wrapped command
-        exec_result = _execute_wrapped(wrapped)
+        exec_result = execute_wrapped(wrapped)
 
         # Sandbox blocks the SecurityServer Mach IPC → security command fails.
         # Exact exit code varies, but the combined output should mention the
@@ -186,13 +152,13 @@ class TestSandboxBlocksKeychainDump:
     def test_wrapped_dump_keychain_is_blocked(self, env_with_registry):
         """dump-keychain must fail inside the sandbox."""
         hook_input = build_guard_input("security dump-keychain")
-        guard_result = _run_guard(hook_input, env_with_registry)
+        guard_result = run_guard(hook_input, env_with_registry)
         assert guard_result.returncode == 0
 
-        wrapped = _extract_wrapped_command(guard_result.stdout)
+        wrapped = wrapped_command(guard_result.stdout)
         assert wrapped is not None
 
-        exec_result = _execute_wrapped(wrapped)
+        exec_result = execute_wrapped(wrapped)
         assert exec_result.returncode != 0, (
             f"Sandbox should block dump-keychain, but wrapped command succeeded. "
             f"stdout={exec_result.stdout!r} stderr={exec_result.stderr!r}"
@@ -210,13 +176,13 @@ class TestSandboxAllowsSafeCommand:
     def test_wrapped_echo_succeeds(self, env_with_registry):
         """A plain `echo` must succeed inside the sandbox wrapper."""
         hook_input = build_guard_input("echo safe output")
-        guard_result = _run_guard(hook_input, env_with_registry)
+        guard_result = run_guard(hook_input, env_with_registry)
         assert guard_result.returncode == 0
 
-        wrapped = _extract_wrapped_command(guard_result.stdout)
+        wrapped = wrapped_command(guard_result.stdout)
         assert wrapped is not None
 
-        exec_result = _execute_wrapped(wrapped)
+        exec_result = execute_wrapped(wrapped)
         assert exec_result.returncode == 0, (
             f"Sandbox should allow harmless echo, but it failed. "
             f"stderr={exec_result.stderr!r}"

@@ -61,6 +61,8 @@ On macOS, a PreToolUse hook wraps every bash command in a Seatbelt sandbox befor
 
 Storing a secret goes through a native OS dialog. The value goes from your keyboard to the keychain. Claude sees "OK: stored."
 
+The same hook also covers the Read tool. If a file contains the value of any stored secret, the read is denied before Claude sees the contents.
+
 On Linux, the guard hook falls back to string matching since Seatbelt is macOS only.
 
 ## Files

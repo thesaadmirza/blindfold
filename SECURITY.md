@@ -58,6 +58,8 @@ This document describes Blindfold's security architecture, threat model, known l
 | Sandboxed commands accessing keychain | Seatbelt sandbox blocks keychain Mach IPC at kernel level | `sandbox.sb`, `secret-guard.sh` |
 | Secret values in command output | PostToolUse hook detects leaked values and emits a `systemMessage` warning instructing Claude to disregard them. Note: Claude Code does not support output replacement for built-in tools, so the raw value may still appear in context. | `secret-redact.sh` |
 | Obfuscated keychain access attempts | Seatbelt operates at Mach IPC level, not string matching (macOS) | `sandbox.sb` |
+| Commands chained onto Blindfold's own scripts | Those scripts run outside the sandbox, so the guard denies a call to one that also carries `;`, `&`, `\|`, redirects, a newline, `$(...)` or backticks outside quotes | `secret-guard.sh` |
+| Reading a file that holds a secret value, e.g. one a command wrote it into | The guard checks each Read target against every stored value and denies the read before the contents reach context | `secret-guard.sh` |
 | Secret registry tampering | Atomic updates via temp file + `jq` validation + `mv` | `lib.sh:update_registry()` |
 
 ### What Blindfold Does NOT Protect Against
@@ -69,6 +71,7 @@ This document describes Blindfold's security architecture, threat model, known l
 | **Secrets shorter than 4 characters** | `MIN_REDACT_LENGTH=4` prevents false positive redaction of short strings. | Configure `MIN_REDACT_LENGTH` in `lib.sh` if needed. Secrets should be long by nature. |
 | **Linux guard bypass via obfuscation** | Linux falls back to string matching (no Seatbelt equivalent). Commands can be obfuscated to bypass pattern matching. | Use macOS for security-critical workloads. Linux bubblewrap (`bwrap`) support is partial. |
 | **`env` command dumping `__SV_` vars** | If a sandboxed command runs `env`, the `__SV_`-prefixed vars containing secrets would be visible. | The LLM doesn't know the `__SV_` prefix exists. The sandbox blocks keychain but not env inspection. |
+| **Grep and other file tools** | Only Read is checked for stored values. Grep in content mode returns matching lines without that check. | Keep secrets out of files in the project. Any file a command writes a secret into is still refused to Read. |
 | **Registry file readable by user** | `secrets-registry.json` lists secret names (not values) with 600 permissions. | Names are not sensitive. Values are in the OS keychain only. |
 
 ## Platform Security Properties
