@@ -12,7 +12,6 @@ INPUT=$(</dev/stdin)
 
 # Read each field on its own: @tsv would turn real newlines into a literal \n
 TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
-COMMAND=$(jq -r '.tool_input.command // ""' <<< "$INPUT" 2>/dev/null)
 
 deny() {
   echo "DENIED by Blindfold: $1" >&2
@@ -26,28 +25,25 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
   FILE_PATH=$(jq -r '.tool_input.file_path // ""' <<< "$INPUT" 2>/dev/null)
   [[ -f "$FILE_PATH" && -r "$FILE_PATH" ]] || exit 0
   source "${SCRIPT_DIR}/lib.sh"
-  [[ -f "$REGISTRY" ]] || exit 0
 
   CONTENT=$(<"$FILE_PATH")
-  PROJECT_PATH=$(get_project_path)
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    for scope in "$PROJECT_PATH" "global"; do
-      value=$(get_secret "$(make_account_key "$scope" "$name")")
-      [[ -n "$value" && ${#value} -ge $MIN_REDACT_LENGTH ]] || continue
-      [[ "$CONTENT" == *"$value"* ]] && deny "${FILE_PATH} contains the value of ${name}."
-    done
-  done < <(registered_secret_names)
+  while IFS=$'\t' read -r scope name; do
+    value=$(get_secret "$(make_account_key "$scope" "$name")")
+    [[ ${#value} -ge $MIN_REDACT_LENGTH ]] || continue
+    [[ "$CONTENT" == *"$value"* ]] && deny "${FILE_PATH} contains the value of ${name}."
+  done < <(registered_secret_scopes)
   exit 0
 fi
 
 [[ "$TOOL_NAME" == "Bash" ]] || exit 0
+COMMAND=$(jq -r '.tool_input.command // ""' <<< "$INPUT" 2>/dev/null)
 [[ -n "$COMMAND" ]] || exit 0
 
-# Wrap a string in single quotes. Uses sed because bash 3.2, the macOS
-# default, keeps the backslashes in a ${var//\'/...} replacement.
+# Wrap a string in single quotes. The replacement sits in a variable because
+# bash 3.2, the macOS default, keeps the backslashes of an inline '\'' there.
 single_quote() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+  local q="'\\''"
+  printf "'%s'" "${1//\'/$q}"
 }
 
 # Exempt Blindfold's own scripts -- must match at start, followed by space or end-of-string
