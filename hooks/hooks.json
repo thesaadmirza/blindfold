@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/secret-guard.sh",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }

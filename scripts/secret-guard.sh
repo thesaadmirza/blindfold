@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# PreToolUse hook: enforces kernel-level sandbox on Bash commands (macOS Seatbelt).
+# PreToolUse hook: enforces kernel-level sandbox on Bash commands (macOS Seatbelt)
+# and keeps Read away from files that hold a stored secret value.
 # Exit 0 with JSON = allow (possibly with modified command)
 # Exit 2 = deny
 set -uo pipefail
@@ -13,14 +14,35 @@ INPUT=$(</dev/stdin)
 TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
 COMMAND=$(jq -r '.tool_input.command // ""' <<< "$INPUT" 2>/dev/null)
 
-[[ "$TOOL_NAME" == "Bash" ]] || exit 0
-[[ -n "$COMMAND" ]] || exit 0
-
 deny() {
   echo "DENIED by Blindfold: $1" >&2
   echo "Use secret-exec.sh to run commands that need secrets." >&2
   exit 2
 }
+
+# Read: refuse a file that contains any stored value, e.g. one a command wrote
+# a secret into. Checked before the read, since output can't be redacted after.
+if [[ "$TOOL_NAME" == "Read" ]]; then
+  FILE_PATH=$(jq -r '.tool_input.file_path // ""' <<< "$INPUT" 2>/dev/null)
+  [[ -f "$FILE_PATH" && -r "$FILE_PATH" ]] || exit 0
+  source "${SCRIPT_DIR}/lib.sh"
+  [[ -f "$REGISTRY" ]] || exit 0
+
+  CONTENT=$(<"$FILE_PATH")
+  PROJECT_PATH=$(get_project_path)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    for scope in "$PROJECT_PATH" "global"; do
+      value=$(get_secret "$(make_account_key "$scope" "$name")")
+      [[ -n "$value" && ${#value} -ge $MIN_REDACT_LENGTH ]] || continue
+      [[ "$CONTENT" == *"$value"* ]] && deny "${FILE_PATH} contains the value of ${name}."
+    done
+  done < <(registered_secret_names)
+  exit 0
+fi
+
+[[ "$TOOL_NAME" == "Bash" ]] || exit 0
+[[ -n "$COMMAND" ]] || exit 0
 
 # Wrap a string in single quotes. Uses sed because bash 3.2, the macOS
 # default, keeps the backslashes in a ${var//\'/...} replacement.

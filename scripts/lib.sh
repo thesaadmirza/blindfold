@@ -306,6 +306,12 @@ add_to_registry() {
   fi
 }
 
+# Every registered secret name, global and project, once each
+registered_secret_names() {
+  [[ -f "$REGISTRY" ]] || return 0
+  jq -r '[.global.secrets[]?] + [.projects | to_entries[]? | .value.secrets[]?] | unique | .[]' "$REGISTRY" 2>/dev/null
+}
+
 parse_scope_arg() {
   local arg="${1:-global}"
   if [[ "$arg" == "project" ]]; then

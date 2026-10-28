@@ -3,6 +3,9 @@
 None of these touch a keychain, so they run inside a sandboxed shell too.
 """
 
+import json
+import os
+
 import pytest
 
 from conftest import (
@@ -85,3 +88,69 @@ class TestWrappedCommandRunsAsWritten:
 
     def test_backslash_is_kept(self):
         assert self._run_through_guard(r"printf '%s\n' 'a\b'") == "a\\b\n"
+
+
+@macos_only
+class TestReadGuard:
+    """Read is refused when the file holds a stored secret value.
+
+    A stub `security` on PATH stands in for the keychain, so these run
+    without one and never open a keychain dialog."""
+
+    SECRET_NAME = "BFTEST_READ"
+    SECRET_VALUE = "read-guard-value-98765"
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, temp_registry):
+        temp_registry.write_text(json.dumps({
+            "version": 3,
+            "global": {"secrets": [self.SECRET_NAME]},
+            "projects": {},
+        }))
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "security"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f'case "$*" in *"global:{self.SECRET_NAME}"*-w*) '
+            f"printf '%s' '{self.SECRET_VALUE}' ;; *) exit 44 ;; esac\n"
+        )
+        stub.chmod(0o755)
+
+        self.env = os.environ.copy()
+        self.env.pop("BLINDFOLD_KEYCHAIN", None)
+        self.env["BLINDFOLD_REGISTRY"] = str(temp_registry)
+        self.env["PATH"] = f"{stub_dir}:{self.env['PATH']}"
+        self.dir = tmp_path
+
+    def _read(self, path):
+        hook_input = json.dumps({
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(path)},
+        })
+        return run_guard(hook_input, self.env)
+
+    def test_file_holding_a_secret_is_denied(self):
+        leaked = self.dir / "out.txt"
+        leaked.write_text(f"token={self.SECRET_VALUE}\n")
+
+        result = self._read(leaked)
+
+        assert result.returncode == 2, f"stderr={result.stderr!r}"
+        assert self.SECRET_NAME in result.stderr
+        assert self.SECRET_VALUE not in result.stderr
+
+    def test_ordinary_file_is_allowed(self):
+        clean = self.dir / "notes.txt"
+        clean.write_text("nothing to see here\n")
+
+        result = self._read(clean)
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert result.stdout.strip() == ""
+
+    def test_missing_file_is_left_to_read(self):
+        result = self._read(self.dir / "does-not-exist")
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == ""

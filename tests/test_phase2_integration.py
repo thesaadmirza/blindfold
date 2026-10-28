@@ -86,10 +86,10 @@ class TestGuardHookBasics:
         )
 
     def test_guard_ignores_non_bash_tools(self, env_with_registry):
-        """Guard should exit 0 silently for non-Bash tools."""
+        """Guard should exit 0 silently for tools it does not handle."""
         hook_input = json.dumps({
-            "tool_name": "Read",
-            "tool_input": {"file_path": "/tmp/foo"},
+            "tool_name": "Glob",
+            "tool_input": {"pattern": "*.py"},
         })
         result = run_guard(hook_input, env_with_registry)
 
