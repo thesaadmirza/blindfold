@@ -71,6 +71,7 @@ This document describes Blindfold's security architecture, threat model, known l
 | **Secrets shorter than 4 characters** | `MIN_REDACT_LENGTH=4` prevents false positive redaction of short strings. | Configure `MIN_REDACT_LENGTH` in `lib.sh` if needed. Secrets should be long by nature. |
 | **Linux guard bypass via obfuscation** | Linux falls back to string matching (no Seatbelt equivalent). Commands can be obfuscated to bypass pattern matching. | Use macOS for security-critical workloads. Linux bubblewrap (`bwrap`) support is partial. |
 | **`env` command dumping `__SV_` vars** | If a sandboxed command runs `env`, the `__SV_`-prefixed vars containing secrets would be visible. | The LLM doesn't know the `__SV_` prefix exists. The sandbox blocks keychain but not env inspection. |
+| **Grep and other file tools** | Only Read is checked for stored values. Grep in content mode returns matching lines without that check. | Keep secrets out of files in the project. Any file a command writes a secret into is still refused to Read. |
 | **Registry file readable by user** | `secrets-registry.json` lists secret names (not values) with 600 permissions. | Names are not sensitive. Values are in the OS keychain only. |
 
 ## Platform Security Properties
