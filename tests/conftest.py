@@ -150,16 +150,19 @@ def build_guard_input(command: str, tool_name: str = "Bash") -> str:
     })
 
 
+def build_read_input(file_path: str) -> str:
+    """Build PreToolUse hook input JSON for a Read call (for secret-guard.sh)."""
+    return json.dumps({
+        "tool_name": "Read",
+        "tool_input": {
+            "file_path": file_path,
+        },
+    })
+
+
 def run_guard(hook_input: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """Run secret-guard.sh with the given hook input on stdin."""
-    return subprocess.run(
-        ["bash", str(SCRIPTS_DIR / "secret-guard.sh")],
-        input=hook_input,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
+    return run_script("secret-guard.sh", env=env, input_text=hook_input)
 
 
 def wrapped_command(guard_stdout: str) -> str | None:

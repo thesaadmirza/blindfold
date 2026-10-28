@@ -11,12 +11,14 @@ import pytest
 from conftest import (
     SCRIPTS_DIR,
     build_guard_input,
+    build_read_input,
     execute_wrapped,
     macos_only,
     run_guard,
     wrapped_command,
 )
 
+REPO_ROOT = SCRIPTS_DIR.parent
 EXEC = SCRIPTS_DIR / "secret-exec.sh"
 LIST = SCRIPTS_DIR / "secret-list.sh"
 
@@ -68,26 +70,20 @@ class TestExemptScriptsCannotCarryOtherCommands:
 class TestWrappedCommandRunsAsWritten:
     """The sandbox wrapper must not change what the command does."""
 
-    def _run_through_guard(self, command: str) -> str:
+    @pytest.mark.parametrize("command,expected", [
+        ("echo 'hello world'", "hello world\n"),
+        ('echo "it\'s here"', "it's here\n"),
+        ("echo one\necho two", "one\ntwo\n"),
+        (r"printf '%s\n' 'a\b'", "a\\b\n"),
+    ])
+    def test_output_matches_unwrapped(self, command, expected):
         result = run_guard(build_guard_input(command))
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         wrapped = wrapped_command(result.stdout)
         assert wrapped is not None, f"Guard did not wrap: {result.stdout!r}"
         executed = execute_wrapped(wrapped)
         assert executed.returncode == 0, f"stderr={executed.stderr!r}"
-        return executed.stdout
-
-    def test_single_quotes(self):
-        assert self._run_through_guard("echo 'hello world'") == "hello world\n"
-
-    def test_quote_inside_double_quotes(self):
-        assert self._run_through_guard('echo "it\'s here"') == "it's here\n"
-
-    def test_multi_line_command(self):
-        assert self._run_through_guard("echo one\necho two") == "one\ntwo\n"
-
-    def test_backslash_is_kept(self):
-        assert self._run_through_guard(r"printf '%s\n' 'a\b'") == "a\\b\n"
+        assert executed.stdout == expected
 
 
 @macos_only
@@ -102,17 +98,14 @@ class TestReadGuard:
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path, temp_registry):
-        temp_registry.write_text(json.dumps({
-            "version": 3,
-            "global": {"secrets": [self.SECRET_NAME]},
-            "projects": {},
-        }))
+        self.registry = temp_registry
+        self._register(global_secrets=[self.SECRET_NAME])
         stub_dir = tmp_path / "bin"
         stub_dir.mkdir()
         stub = stub_dir / "security"
         stub.write_text(
             "#!/bin/sh\n"
-            f'case "$*" in *"global:{self.SECRET_NAME}"*-w*) '
+            f'case "$*" in *":{self.SECRET_NAME} "*-w*) '
             f"printf '%s' '{self.SECRET_VALUE}' ;; *) exit 44 ;; esac\n"
         )
         stub.chmod(0o755)
@@ -123,22 +116,37 @@ class TestReadGuard:
         self.env["PATH"] = f"{stub_dir}:{self.env['PATH']}"
         self.dir = tmp_path
 
-    def _read(self, path):
-        hook_input = json.dumps({
-            "tool_name": "Read",
-            "tool_input": {"file_path": str(path)},
-        })
-        return run_guard(hook_input, self.env)
+    def _register(self, global_secrets=(), projects=None):
+        self.registry.write_text(json.dumps({
+            "version": 3,
+            "global": {"secrets": list(global_secrets)},
+            "projects": projects or {},
+        }))
 
-    def test_file_holding_a_secret_is_denied(self):
+    def _read(self, path):
+        return run_guard(build_read_input(str(path)), self.env)
+
+    def _write_leak(self):
         leaked = self.dir / "out.txt"
         leaked.write_text(f"token={self.SECRET_VALUE}\n")
+        return leaked
 
-        result = self._read(leaked)
+    def test_file_holding_a_secret_is_denied(self):
+        result = self._read(self._write_leak())
 
         assert result.returncode == 2, f"stderr={result.stderr!r}"
         assert self.SECRET_NAME in result.stderr
         assert self.SECRET_VALUE not in result.stderr
+
+    def test_file_holding_a_project_secret_is_denied(self):
+        # The guard runs from tests/, so the project is the repo root
+        project = str(REPO_ROOT)
+        self._register(projects={project: {"secrets": [self.SECRET_NAME]}})
+
+        result = self._read(self._write_leak())
+
+        assert result.returncode == 2, f"stderr={result.stderr!r}"
+        assert self.SECRET_NAME in result.stderr
 
     def test_ordinary_file_is_allowed(self):
         clean = self.dir / "notes.txt"
