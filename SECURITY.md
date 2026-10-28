@@ -58,6 +58,7 @@ This document describes Blindfold's security architecture, threat model, known l
 | Sandboxed commands accessing keychain | Seatbelt sandbox blocks keychain Mach IPC at kernel level | `sandbox.sb`, `secret-guard.sh` |
 | Secret values in command output | PostToolUse hook detects leaked values and emits a `systemMessage` warning instructing Claude to disregard them. Note: Claude Code does not support output replacement for built-in tools, so the raw value may still appear in context. | `secret-redact.sh` |
 | Obfuscated keychain access attempts | Seatbelt operates at Mach IPC level, not string matching (macOS) | `sandbox.sb` |
+| Commands chained onto Blindfold's own scripts | Those scripts run outside the sandbox, so the guard denies a call to one that also carries `;`, `&`, `\|`, redirects, a newline, `$(...)` or backticks outside quotes | `secret-guard.sh` |
 | Secret registry tampering | Atomic updates via temp file + `jq` validation + `mv` | `lib.sh:update_registry()` |
 
 ### What Blindfold Does NOT Protect Against

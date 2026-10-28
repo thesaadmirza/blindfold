@@ -36,8 +36,44 @@ is_exempt() {
   return 1
 }
 
+# True when the command is one plain invocation. Exempt scripts run outside
+# the sandbox, so nothing may ride along after them: no ; & | < > ( ) or
+# newline outside quotes, and no $( or backtick anywhere the shell would run it.
+is_single_command() {
+  local cmd="$1" quote="" c next i
+  for ((i = 0; i < ${#cmd}; i++)); do
+    c="${cmd:i:1}"
+    next="${cmd:i+1:1}"
+    if [[ "$quote" == "'" ]]; then
+      [[ "$c" == "'" ]] && quote=""
+      continue
+    fi
+    if [[ "$c" == "\\" ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    if [[ "$quote" == '"' ]]; then
+      case "$c" in
+        '"') quote="" ;;
+        '`') return 1 ;;
+        '$') [[ "$next" == "(" ]] && return 1 ;;
+      esac
+      continue
+    fi
+    case "$c" in
+      "'" | '"') quote="$c" ;;
+      ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | $'\n' | $'\r') return 1 ;;
+      '$') [[ "$next" == "(" || "$next" == "'" ]] && return 1 ;;
+    esac
+  done
+  [[ -z "$quote" ]]
+}
+
 for script in secret-exec.sh secret-store.sh secret-list.sh secret-delete.sh; do
-  is_exempt "$COMMAND" "${SCRIPT_DIR}/${script}" && exit 0
+  if is_exempt "$COMMAND" "${SCRIPT_DIR}/${script}"; then
+    is_single_command "$COMMAND" || deny "Run ${script} on its own, not chained with other commands."
+    exit 0
+  fi
 done
 
 # On macOS with Seatbelt: wrap the command in sandbox-exec
