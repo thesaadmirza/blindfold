@@ -91,27 +91,25 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 	e.Sent, e.Received = splice(client, buffered.Reader, upstream)
 }
 
-// splice copies both ways until each side is done. The client is read through
-// its bufio.Reader, which may already hold bytes sent right after CONNECT.
+// splice copies both ways until either side is done, then closes both. Waiting
+// for the other side as well would keep the tunnel open until a server's own
+// keep-alive timeout, long after the client has gone. The client is read
+// through its bufio.Reader, which may already hold bytes sent right after CONNECT.
 func splice(client net.Conn, clientReader *bufio.Reader, upstream net.Conn) (sent, received int64) {
-	done := make(chan struct{})
+	done := make(chan struct{}, 2)
 	go func() {
 		received, _ = io.Copy(client, upstream)
-		closeWrite(client)
-		close(done)
+		done <- struct{}{}
 	}()
-	sent, _ = io.Copy(upstream, clientReader)
-	closeWrite(upstream)
+	go func() {
+		sent, _ = io.Copy(upstream, clientReader)
+		done <- struct{}{}
+	}()
 	<-done
 	client.Close()
 	upstream.Close()
+	<-done
 	return sent, received
-}
-
-func closeWrite(c net.Conn) {
-	if hc, ok := c.(interface{ CloseWrite() error }); ok {
-		hc.CloseWrite()
-	}
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {

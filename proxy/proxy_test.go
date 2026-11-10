@@ -73,6 +73,43 @@ func TestTunnelsHTTPSWithoutTouchingTLS(t *testing.T) {
 	}
 }
 
+func TestTunnelEndsWhenTheClientHangsUp(t *testing.T) {
+	// An upstream that accepts and then never writes or closes, like a server
+	// sitting on a keep-alive connection
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	go func() {
+		for {
+			c, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			io.Copy(io.Discard, c)
+		}
+	}()
+	proxyURL, entries := startProxy(t)
+
+	conn, err := net.Dial("tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := upstream.Addr().String()
+	io.WriteString(conn, "CONNECT "+addr+" HTTP/1.1\r\nHost: "+addr+"\r\n\r\n")
+	if _, err := http.ReadResponse(bufio.NewReader(conn), nil); err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(conn, "hello")
+	conn.Close()
+
+	if e := nextEntry(t, entries); e.Kind != "connect" || e.Sent != 5 {
+		t.Fatalf("entry = %+v", e)
+	}
+}
+
 func TestForwardsPlainHTTP(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
