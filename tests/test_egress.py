@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,12 @@ class TestEgressRuntime:
         result = execute_wrapped(wrap_through_guard(cmd, egress_env))
 
         assert result.stdout == "200", f"stdout={result.stdout!r} stderr={result.stderr!r}"
-        with open(egress_env["BLINDFOLD_EGRESS_LOG"]) as f:
-            entries = [json.loads(line) for line in f]
-        assert any(e["kind"] == "connect" and e["host"] == "example.com:443" for e in entries)
+        # The proxy writes the line as the tunnel closes, just after curl exits
+        log = Path(egress_env["BLINDFOLD_EGRESS_LOG"])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            entries = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            if any(e["kind"] == "connect" and e["host"] == "example.com:443" for e in entries):
+                return
+            time.sleep(0.1)
+        pytest.fail(f"no connect entry for example.com:443 in {entries}")
