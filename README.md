@@ -108,6 +108,10 @@ Add hooks to `~/.claude/settings.json`:
       {
         "matcher": "Bash",
         "hooks": [{"type": "command", "command": "bash ~/.claude/skills/blindfold/scripts/secret-guard.sh", "timeout": 5}]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [{"type": "command", "command": "bash ~/.claude/skills/blindfold/scripts/secret-guard.sh", "timeout": 10}]
       }
     ],
     "PostToolUse": [
