@@ -6,12 +6,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SANDBOX_PROFILE="${SCRIPT_DIR}/sandbox.sb"
 
 INPUT=$(</dev/stdin)
 
 # Read each field on its own: @tsv would turn real newlines into a literal \n
 TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
+[[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "Read" ]] || exit 0
+
+_SV_LIB_DIR="$SCRIPT_DIR"
+source "${SCRIPT_DIR}/lib.sh"
 
 # deny REASON [HINT]
 deny() {
@@ -25,7 +28,6 @@ deny() {
 if [[ "$TOOL_NAME" == "Read" ]]; then
   FILE_PATH=$(jq -r '.tool_input.file_path // ""' <<< "$INPUT" 2>/dev/null)
   [[ -f "$FILE_PATH" && -r "$FILE_PATH" ]] || exit 0
-  source "${SCRIPT_DIR}/lib.sh"
 
   CONTENT=$(<"$FILE_PATH")
   while IFS=$'\t' read -r scope name; do
@@ -36,16 +38,8 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
   exit 0
 fi
 
-[[ "$TOOL_NAME" == "Bash" ]] || exit 0
 COMMAND=$(jq -r '.tool_input.command // ""' <<< "$INPUT" 2>/dev/null)
 [[ -n "$COMMAND" ]] || exit 0
-
-# Wrap a string in single quotes. The replacement sits in a variable because
-# bash 3.2, the macOS default, keeps the backslashes of an inline '\'' there.
-single_quote() {
-  local q="'\\''"
-  printf "'%s'" "${1//\'/$q}"
-}
 
 # Exempt Blindfold's own scripts -- must match at start, followed by space or end-of-string
 is_exempt() {
@@ -95,18 +89,18 @@ for script in secret-exec.sh secret-store.sh secret-list.sh secret-delete.sh; do
   fi
 done
 
-# On macOS with Seatbelt: wrap the command in sandbox-exec
-if [[ "$OSTYPE" == darwin* && -f "$SANDBOX_PROFILE" ]] && command -v sandbox-exec &>/dev/null; then
-  PREFIX=""
-  # Egress lockdown: a stricter profile, with traffic routed through the proxy
-  if [[ "${BLINDFOLD_EGRESS:-}" == "proxy" ]]; then
-    source "${SCRIPT_DIR}/lib.sh"
-    SANDBOX_PROFILE=$(get_sandbox_profile)
-    PORT=$(ensure_proxy) || deny "Egress lockdown is on, but the proxy did not start." \
-      "Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
-    PREFIX="env $(proxy_env "$PORT") "
-  fi
-  WRAPPED="${PREFIX}sandbox-exec -f $(single_quote "$SANDBOX_PROFILE") bash -c $(single_quote "$COMMAND")"
+# Wrap the command in the sandbox lib.sh picks (Seatbelt on macOS, with egress
+# lockdown when it's on). Each word is single-quoted; the replacement sits in a
+# variable because bash 3.2, the macOS default, keeps the backslashes of an
+# inline '\'' there.
+build_sandbox_argv || deny "$EGRESS_SETUP_ERROR" "$EGRESS_SETUP_HINT"
+if [[ ${#SANDBOX_ARGV[@]} -gt 0 ]]; then
+  q="'\\''"
+  WRAPPED=""
+  for word in "${SANDBOX_ARGV[@]}" bash -c "$COMMAND"; do
+    WRAPPED+="'${word//\'/$q}' "
+  done
+  WRAPPED="${WRAPPED% }"
 
   jq -n --arg cmd "$WRAPPED" '{
     hookSpecificOutput: {

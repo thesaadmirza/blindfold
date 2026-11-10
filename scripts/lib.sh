@@ -12,7 +12,8 @@ BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-}"
 # through the local proxy (macOS only, experimental).
 BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
 
-_SV_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Callers that already know this directory can set _SV_LIB_DIR first and skip the lookup
+_SV_LIB_DIR="${_SV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PROXY_BIN="${BLINDFOLD_PROXY_BIN:-${_SV_LIB_DIR}/../bin/blindfold-proxy}"
 PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-$HOME/.config/blindfold/run/proxy.port}"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
@@ -57,23 +58,16 @@ has_sandbox() {
 }
 
 egress_enabled() {
-  [[ "$BLINDFOLD_EGRESS" == "proxy" && "$(get_platform)" == "Darwin" ]]
+  [[ "$BLINDFOLD_EGRESS" == "proxy" && "$OSTYPE" == darwin* ]]
 }
 
-get_sandbox_profile() {
-  if egress_enabled; then
-    echo "${_SV_LIB_DIR}/sandbox-egress.sb"
-  else
-    echo "${_SV_LIB_DIR}/sandbox.sb"
-  fi
-}
-
-# Prints the port of a running proxy, starting one first if needed
+# Sets PROXY_PORT to a running proxy, starting one first if needed. The wait is
+# capped at 2s so a slow start fails cleanly inside the hook's 5s timeout.
 ensure_proxy() {
-  local port i
-  port=$(cat "$PROXY_PORT_FILE" 2>/dev/null)
-  if [[ -n "$port" ]] && (: <>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-    echo "$port"
+  local i
+  PROXY_PORT=""
+  read -r PROXY_PORT <"$PROXY_PORT_FILE" 2>/dev/null
+  if [[ -n "$PROXY_PORT" ]] && { true <>"/dev/tcp/127.0.0.1/${PROXY_PORT}"; } 2>/dev/null; then
     return 0
   fi
   [[ -x "$PROXY_BIN" ]] || return 1
@@ -82,36 +76,43 @@ ensure_proxy() {
   rm -f "$PROXY_PORT_FILE"
   nohup "$PROXY_BIN" --port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" </dev/null >/dev/null 2>&1 &
   echo "$!" > "${PROXY_PORT_FILE%.port}.pid"
-  for ((i = 0; i < 50; i++)); do
+  for ((i = 0; i < 100; i++)); do
     if [[ -s "$PROXY_PORT_FILE" ]]; then
-      cat "$PROXY_PORT_FILE"
+      read -r PROXY_PORT <"$PROXY_PORT_FILE"
       return 0
     fi
-    sleep 0.1
+    sleep 0.02
   done
   return 1
 }
 
-# The variables that route a command's traffic through the proxy on port $1
-proxy_env() {
-  local url="http://127.0.0.1:$1" local_hosts="localhost,127.0.0.1,::1"
-  echo "HTTPS_PROXY=$url https_proxy=$url HTTP_PROXY=$url http_proxy=$url ALL_PROXY=$url all_proxy=$url NO_PROXY=$local_hosts no_proxy=$local_hosts"
+# Sets SANDBOX_ARGV to the words that run a command sandboxed, or to nothing
+# where there is no sandbox. The guard and run_sandboxed both use it, so the
+# choice of profile and proxy lives in one place. Fails when egress lockdown is
+# on but can't be set up, so callers refuse rather than run unprotected.
+build_sandbox_argv() {
+  SANDBOX_ARGV=()
+  [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
+
+  if egress_enabled; then
+    local profile="${_SV_LIB_DIR}/sandbox-egress.sb"
+    [[ -f "$profile" ]] && ensure_proxy || return 1
+    local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
+    SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
+      "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts"
+      sandbox-exec -f "$profile")
+  elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
+    SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
+  fi
 }
 
+EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
+EGRESS_SETUP_HINT="Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
+
 run_sandboxed() {
-  local profile port
-  profile=$(get_sandbox_profile)
-  if [[ "$(get_platform)" == "Darwin" && -f "$profile" ]] && command -v sandbox-exec &>/dev/null; then
-    if egress_enabled; then
-      port=$(ensure_proxy) || { echo "ERROR: Egress lockdown is on, but the proxy did not start. Build it with scripts/build-proxy.sh." >&2; return 1; }
-      # proxy_env is space-separated NAME=value pairs with no spaces inside, so word splitting is intended
-      env $(proxy_env "$port") sandbox-exec -f "$profile" "$@"
-    else
-      sandbox-exec -f "$profile" "$@"
-    fi
-  else
-    "$@"
-  fi
+  build_sandbox_argv || { echo "ERROR: ${EGRESS_SETUP_ERROR} ${EGRESS_SETUP_HINT}" >&2; return 1; }
+  # The +-form keeps an empty array from tripping set -u on bash 3.2
+  ${SANDBOX_ARGV[@]+"${SANDBOX_ARGV[@]}"} "$@"
 }
 
 check_dependencies() {
