@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -24,11 +25,15 @@ from conftest import (
     macos_only,
     run_guard,
     run_script,
-    wrapped_command,
+    wrap_through_guard,
 )
 
 REPO_PROXY = SCRIPTS_DIR.parent / "bin" / "blindfold-proxy"
+BASE_PROFILE = SCRIPTS_DIR / "sandbox.sb"
 EGRESS_PROFILE = SCRIPTS_DIR / "sandbox-egress.sb"
+PY = "python3 -I -c"
+DIRECT_CONNECT = f"{PY} \"import socket; socket.create_connection(('1.1.1.1', 443), 3)\""
+DNS_LOOKUP = f"{PY} \"import socket; socket.gethostbyname('example.com')\""
 
 pytestmark = macos_only
 
@@ -45,58 +50,51 @@ def proxy_bin(tmp_path_factory):
     return out
 
 
+def _port_file(env) -> Path:
+    return Path(env["BLINDFOLD_PROXY_PORT_FILE"])
+
+
+def _pid_file(env) -> Path:
+    return _port_file(env).with_suffix(".pid")
+
+
 @pytest.fixture()
 def egress_env(tmp_path, temp_registry, proxy_bin):
-    run_dir = tmp_path / "run"
     env = os.environ.copy()
+    env.pop("BLINDFOLD_KEYCHAIN", None)
     env.update({
         "BLINDFOLD_EGRESS": "proxy",
         "BLINDFOLD_PROXY_BIN": str(proxy_bin),
-        "BLINDFOLD_PROXY_PORT_FILE": str(run_dir / "proxy.port"),
+        "BLINDFOLD_PROXY_PORT_FILE": str(tmp_path / "run" / "proxy.port"),
         "BLINDFOLD_EGRESS_LOG": str(tmp_path / "egress.jsonl"),
         "BLINDFOLD_REGISTRY": str(temp_registry),
     })
     yield env
-    pid_file = run_dir / "proxy.pid"
-    if pid_file.exists():
-        try:
-            os.kill(int(pid_file.read_text()), signal.SIGTERM)
-        except (ProcessLookupError, ValueError):
-            pass
-
-
-def _port(env) -> str:
-    with open(env["BLINDFOLD_PROXY_PORT_FILE"]) as f:
-        return f.read().strip()
-
-
-def _wrap(command: str, env) -> str:
-    result = run_guard(build_guard_input(command), env)
-    assert result.returncode == 0, f"stderr={result.stderr!r}"
-    wrapped = wrapped_command(result.stdout)
-    assert wrapped is not None, f"Guard did not wrap: {result.stdout!r}"
-    return wrapped
+    try:
+        os.kill(int(_pid_file(env).read_text()), signal.SIGTERM)
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        pass
 
 
 class TestEgressWiring:
 
     def test_guard_starts_the_proxy_and_uses_the_egress_profile(self, egress_env):
-        wrapped = _wrap("echo hi", egress_env)
+        wrapped = wrap_through_guard("echo hi", egress_env)
 
-        port = _port(egress_env)
+        port = _port_file(egress_env).read_text().strip()
         assert str(EGRESS_PROFILE) in wrapped
         assert f"HTTPS_PROXY=http://127.0.0.1:{port}" in wrapped
         assert "NO_PROXY=localhost,127.0.0.1,::1" in wrapped
 
     def test_a_running_proxy_is_reused(self, egress_env):
-        _wrap("echo one", egress_env)
-        pid_file = egress_env["BLINDFOLD_PROXY_PORT_FILE"].replace(".port", ".pid")
-        first_port, first_pid = _port(egress_env), open(pid_file).read()
+        wrap_through_guard("echo one", egress_env)
+        first_port = _port_file(egress_env).read_text()
+        first_pid = _pid_file(egress_env).read_text()
 
-        _wrap("echo two", egress_env)
+        wrap_through_guard("echo two", egress_env)
 
-        assert _port(egress_env) == first_port
-        assert open(pid_file).read() == first_pid
+        assert _port_file(egress_env).read_text() == first_port
+        assert _pid_file(egress_env).read_text() == first_pid
 
     def test_missing_proxy_binary_is_denied(self, egress_env):
         egress_env["BLINDFOLD_PROXY_BIN"] = "/nonexistent/blindfold-proxy"
@@ -109,10 +107,16 @@ class TestEgressWiring:
     def test_egress_is_off_by_default(self, egress_env):
         egress_env.pop("BLINDFOLD_EGRESS")
 
-        wrapped = _wrap("echo hi", egress_env)
+        wrapped = wrap_through_guard("echo hi", egress_env)
 
-        assert str(SCRIPTS_DIR / "sandbox.sb") in wrapped
+        assert str(BASE_PROFILE) in wrapped
         assert "HTTPS_PROXY" not in wrapped
+
+    def test_egress_profile_keeps_every_base_rule(self):
+        egress_rules = set(EGRESS_PROFILE.read_text().splitlines())
+        missing = [line for line in BASE_PROFILE.read_text().splitlines() if line not in egress_rules]
+
+        assert not missing, f"sandbox-egress.sb is missing rules from sandbox.sb: {missing}"
 
 
 def _egress_sandbox_applies() -> bool:
@@ -133,37 +137,26 @@ def _online() -> bool:
                     reason="macOS refuses a network sandbox inside another sandbox")
 class TestEgressRuntime:
 
-    PY = "python3 -I -c"
+    @pytest.mark.parametrize("command", [DIRECT_CONNECT, DNS_LOOKUP], ids=["direct-connect", "dns"])
+    def test_traffic_that_skips_the_proxy_is_refused(self, egress_env, command):
+        result = execute_wrapped(wrap_through_guard(command, egress_env))
 
-    def test_direct_connection_out_is_refused(self, egress_env):
-        cmd = f"{self.PY} \"import socket; socket.create_connection(('1.1.1.1', 443), 3)\""
-
-        result = execute_wrapped(_wrap(cmd, egress_env))
-
-        assert result.returncode != 0, "a direct connection got out of the sandbox"
-
-    def test_dns_lookup_is_refused(self, egress_env):
-        cmd = f"{self.PY} \"import socket; socket.gethostbyname('example.com')\""
-
-        result = execute_wrapped(_wrap(cmd, egress_env))
-
-        assert result.returncode != 0, "a DNS lookup worked inside the sandbox"
+        assert result.returncode != 0, "traffic got out of the sandbox without the proxy"
 
     def test_loopback_still_works(self, egress_env):
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             url = f"http://127.0.0.1:{srv.server_address[1]}/"
-            result = execute_wrapped(_wrap(f"curl -s -o /dev/null -w %{{http_code}} {url}", egress_env))
+            cmd = f"curl -s -o /dev/null -w %{{http_code}} {url}"
+            result = execute_wrapped(wrap_through_guard(cmd, egress_env))
         finally:
             srv.shutdown()
 
         assert result.stdout == "200", f"stdout={result.stdout!r} stderr={result.stderr!r}"
 
     def test_secret_exec_is_locked_down_too(self, egress_env):
-        cmd = f"{self.PY} \"import socket; socket.create_connection(('1.1.1.1', 443), 3)\""
-
-        result = run_script("secret-exec.sh", [cmd], env=egress_env)
+        result = run_script("secret-exec.sh", [DIRECT_CONNECT], env=egress_env)
 
         assert result.returncode != 0, "secret-exec let a direct connection out"
 
@@ -171,7 +164,7 @@ class TestEgressRuntime:
     def test_https_goes_through_the_proxy_and_is_logged(self, egress_env):
         cmd = "curl -s -o /dev/null -w %{http_code} --max-time 15 https://example.com/"
 
-        result = execute_wrapped(_wrap(cmd, egress_env))
+        result = execute_wrapped(wrap_through_guard(cmd, egress_env))
 
         assert result.stdout == "200", f"stdout={result.stdout!r} stderr={result.stderr!r}"
         with open(egress_env["BLINDFOLD_EGRESS_LOG"]) as f:

@@ -15,7 +15,7 @@ from conftest import (
     execute_wrapped,
     macos_only,
     run_guard,
-    wrapped_command,
+    wrap_through_guard,
 )
 
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -77,11 +77,7 @@ class TestWrappedCommandRunsAsWritten:
         (r"printf '%s\n' 'a\b'", "a\\b\n"),
     ])
     def test_output_matches_unwrapped(self, command, expected):
-        result = run_guard(build_guard_input(command))
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        wrapped = wrapped_command(result.stdout)
-        assert wrapped is not None, f"Guard did not wrap: {result.stdout!r}"
-        executed = execute_wrapped(wrapped)
+        executed = execute_wrapped(wrap_through_guard(command))
         assert executed.returncode == 0, f"stderr={executed.stderr!r}"
         assert executed.stdout == expected
 

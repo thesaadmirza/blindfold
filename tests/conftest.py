@@ -180,6 +180,15 @@ def wrapped_command(guard_stdout: str) -> str | None:
         return None
 
 
+def wrap_through_guard(command: str, env: dict | None = None) -> str:
+    """Run a Bash command through the guard and return the wrapped command."""
+    result = run_guard(build_guard_input(command), env)
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    wrapped = wrapped_command(result.stdout)
+    assert wrapped is not None, f"Guard did not wrap: {result.stdout!r}"
+    return wrapped
+
+
 def execute_wrapped(wrapped_cmd: str) -> subprocess.CompletedProcess:
     """Execute a sandbox-wrapped command string."""
     return subprocess.run(
