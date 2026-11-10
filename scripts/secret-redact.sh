@@ -29,10 +29,7 @@ REDACTED_RESULT="$TOOL_RESULT"
 LEAKED_NAMES=()
 PROJECT_PATH=$(get_project_path)
 
-ALL_SECRETS=$(jq -r '
-  [.global.secrets[]?] + [.projects | to_entries[]? | .value.secrets[]?]
-  | unique | .[]
-' "$REGISTRY" 2>/dev/null)
+ALL_SECRETS=$(registered_secret_names)
 
 while IFS= read -r name; do
   [[ -n "$name" ]] || continue
