@@ -38,7 +38,11 @@ func main() {
 		}
 	}
 
-	srv := &http.Server{Handler: NewProxy(record), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Handler:           NewProxy(record),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	log.Fatal(srv.Serve(ln))
 }
 
@@ -66,11 +70,8 @@ func writePortFile(path string, port int) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
+	// os.CreateTemp already creates the file with mode 0600
 	if _, err := tmp.WriteString(strconv.Itoa(port) + "\n"); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
 		return err
 	}

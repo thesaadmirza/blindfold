@@ -29,26 +29,27 @@ type Entry struct {
 // Proxy tunnels CONNECT requests and forwards plain HTTP ones. It never looks
 // inside a tunnel and never touches secrets.
 type Proxy struct {
-	Record func(Entry)
-	Dial   func(ctx context.Context, network, addr string) (net.Conn, error)
-
+	record    func(Entry)
+	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
 	forwarder *httputil.ReverseProxy
 }
 
 func NewProxy(record func(Entry)) *Proxy {
-	p := &Proxy{Record: record, Dial: (&net.Dialer{Timeout: dialTimeout}).DialContext}
-	p.forwarder = &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL = pr.In.URL
-			pr.Out.Host = pr.In.Host
-		},
-		// Proxy: nil, so the forwarder never sends traffic back through a proxy
-		Transport: &http.Transport{
-			DialContext:         func(ctx context.Context, n, a string) (net.Conn, error) { return p.Dial(ctx, n, a) },
-			TLSHandshakeTimeout: dialTimeout,
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	return &Proxy{
+		record: record,
+		dial:   dialer.DialContext,
+		forwarder: &httputil.ReverseProxy{
+			// The outgoing request is already a copy of the absolute-URL one we got
+			Rewrite: func(*httputil.ProxyRequest) {},
+			// Proxy: nil, so the forwarder never sends traffic back through a proxy
+			Transport: &http.Transport{
+				DialContext:         dialer.DialContext,
+				TLSHandshakeTimeout: dialTimeout,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 	}
-	return p
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,9 +66,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 	e := Entry{Kind: "connect", Host: r.Host}
 	start := time.Now()
-	defer func() { p.record(e, start) }()
+	defer func() { p.log(e, start) }()
 
-	upstream, err := p.Dial(r.Context(), "tcp", r.Host)
+	upstream, err := p.dial(r.Context(), "tcp", r.Host)
 	if err != nil {
 		e.Status, e.Error = http.StatusBadGateway, err.Error()
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
@@ -119,16 +120,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	p.forwarder.ServeHTTP(rec, r)
 	e.Status = rec.status
-	p.record(e, start)
+	p.log(e, start)
 }
 
-func (p *Proxy) record(e Entry, start time.Time) {
-	if p.Record == nil {
-		return
-	}
+func (p *Proxy) log(e Entry, start time.Time) {
 	e.Time = start.UTC().Format(time.RFC3339)
 	e.Millis = time.Since(start).Milliseconds()
-	p.Record(e)
+	p.record(e)
 }
 
 type statusRecorder struct {
