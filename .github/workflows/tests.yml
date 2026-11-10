@@ -31,6 +31,20 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: proxy/go.mod
+          cache-dependency-path: proxy/go.mod
+
+      - name: Test and build the proxy
+        working-directory: proxy
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race ./...
+          go build -o ../bin/blindfold-proxy .
+
       - name: Make scripts executable
         run: chmod +x scripts/*.sh
 
