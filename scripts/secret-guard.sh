@@ -13,9 +13,10 @@ INPUT=$(</dev/stdin)
 # Read each field on its own: @tsv would turn real newlines into a literal \n
 TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
 
+# deny REASON [HINT]
 deny() {
   echo "DENIED by Blindfold: $1" >&2
-  echo "Use secret-exec.sh to run commands that need secrets." >&2
+  echo "${2:-Use secret-exec.sh to run commands that need secrets.}" >&2
   exit 2
 }
 
@@ -96,7 +97,16 @@ done
 
 # On macOS with Seatbelt: wrap the command in sandbox-exec
 if [[ "$OSTYPE" == darwin* && -f "$SANDBOX_PROFILE" ]] && command -v sandbox-exec &>/dev/null; then
-  WRAPPED="sandbox-exec -f $(single_quote "$SANDBOX_PROFILE") bash -c $(single_quote "$COMMAND")"
+  PREFIX=""
+  # Egress lockdown: a stricter profile, with traffic routed through the proxy
+  if [[ "${BLINDFOLD_EGRESS:-}" == "proxy" ]]; then
+    source "${SCRIPT_DIR}/lib.sh"
+    SANDBOX_PROFILE=$(get_sandbox_profile)
+    PORT=$(ensure_proxy) || deny "Egress lockdown is on, but the proxy did not start." \
+      "Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
+    PREFIX="env $(proxy_env "$PORT") "
+  fi
+  WRAPPED="${PREFIX}sandbox-exec -f $(single_quote "$SANDBOX_PROFILE") bash -c $(single_quote "$COMMAND")"
 
   jq -n --arg cmd "$WRAPPED" '{
     hookSpecificOutput: {

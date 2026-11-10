@@ -8,11 +8,18 @@ ACCOUNT_PREFIX="claude-secret"
 MIN_REDACT_LENGTH=4
 # Default to login keychain. Set BLINDFOLD_KEYCHAIN to use a dedicated keychain.
 BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-}"
+# Set BLINDFOLD_EGRESS=proxy to let sandboxed commands reach the network only
+# through the local proxy (macOS only, experimental).
+BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
+
+_SV_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROXY_BIN="${BLINDFOLD_PROXY_BIN:-${_SV_LIB_DIR}/../bin/blindfold-proxy}"
+PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-$HOME/.config/blindfold/run/proxy.port}"
+EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
-_SV_SANDBOX_PROFILE=""
 _SV_PLATFORM=""
 
 # Returns the keychain path arg for security commands, or empty if using login keychain.
@@ -49,22 +56,59 @@ has_sandbox() {
   esac
 }
 
+egress_enabled() {
+  [[ "$BLINDFOLD_EGRESS" == "proxy" && "$(get_platform)" == "Darwin" ]]
+}
+
 get_sandbox_profile() {
-  if [[ -n "$_SV_SANDBOX_PROFILE" ]]; then
-    echo "$_SV_SANDBOX_PROFILE"
-    return
+  if egress_enabled; then
+    echo "${_SV_LIB_DIR}/sandbox-egress.sb"
+  else
+    echo "${_SV_LIB_DIR}/sandbox.sb"
   fi
-  local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  _SV_SANDBOX_PROFILE="${script_dir}/sandbox.sb"
-  echo "$_SV_SANDBOX_PROFILE"
+}
+
+# Prints the port of a running proxy, starting one first if needed
+ensure_proxy() {
+  local port i
+  port=$(cat "$PROXY_PORT_FILE" 2>/dev/null)
+  if [[ -n "$port" ]] && (: <>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+    echo "$port"
+    return 0
+  fi
+  [[ -x "$PROXY_BIN" ]] || return 1
+
+  mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
+  rm -f "$PROXY_PORT_FILE"
+  nohup "$PROXY_BIN" --port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" </dev/null >/dev/null 2>&1 &
+  echo "$!" > "${PROXY_PORT_FILE%.port}.pid"
+  for ((i = 0; i < 50; i++)); do
+    if [[ -s "$PROXY_PORT_FILE" ]]; then
+      cat "$PROXY_PORT_FILE"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# The variables that route a command's traffic through the proxy on port $1
+proxy_env() {
+  local url="http://127.0.0.1:$1" local_hosts="localhost,127.0.0.1,::1"
+  echo "HTTPS_PROXY=$url https_proxy=$url HTTP_PROXY=$url http_proxy=$url ALL_PROXY=$url all_proxy=$url NO_PROXY=$local_hosts no_proxy=$local_hosts"
 }
 
 run_sandboxed() {
-  local profile
+  local profile port
   profile=$(get_sandbox_profile)
   if [[ "$(get_platform)" == "Darwin" && -f "$profile" ]] && command -v sandbox-exec &>/dev/null; then
-    sandbox-exec -f "$profile" "$@"
+    if egress_enabled; then
+      port=$(ensure_proxy) || { echo "ERROR: Egress lockdown is on, but the proxy did not start. Build it with scripts/build-proxy.sh." >&2; return 1; }
+      # proxy_env is space-separated NAME=value pairs with no spaces inside, so word splitting is intended
+      env $(proxy_env "$port") sandbox-exec -f "$profile" "$@"
+    else
+      sandbox-exec -f "$profile" "$@"
+    fi
   else
     "$@"
   fi
