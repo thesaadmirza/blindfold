@@ -8,8 +8,9 @@ ACCOUNT_PREFIX="claude-secret"
 MIN_REDACT_LENGTH=4
 # Default to login keychain. Set BLINDFOLD_KEYCHAIN to use a dedicated keychain.
 BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-}"
-# Set BLINDFOLD_EGRESS=proxy to let sandboxed commands reach the network only
-# through the local proxy (macOS only, experimental).
+# BLINDFOLD_EGRESS=proxy lets sandboxed commands reach the network only
+# through the local proxy (macOS only, experimental). The settings file can
+# turn it on too, and the environment can't turn off what the file turned on.
 BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
 
 # Callers that already know this directory can set _SV_LIB_DIR first and skip the lookup
@@ -32,6 +33,9 @@ PROJECT_POLICY_FILE=".blindfold.toml"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 # One line per secret filled in, echoed back or refused
 AUDIT_LOG="${BLINDFOLD_AUDIT_LOG:-${EGRESS_LOG%/*}/audit.jsonl}"
+# Blindfold's own switches, as NAME=value lines. It sits in CONFIG_DIR, which
+# the agent can't write under lockdown, so the agent can't turn them off.
+SETTINGS_FILE="${CONFIG_DIR}/settings"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
@@ -117,6 +121,11 @@ ensure_proxy() {
 # on but can't be set up, so callers refuse rather than run unprotected.
 build_sandbox_argv() {
   SANDBOX_ARGV=() POLICY_NAMES=()
+  if [[ -n "$SETTINGS_ERROR" ]]; then
+    EGRESS_SETUP_ERROR="$SETTINGS_ERROR"
+    EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent. Each line is BLINDFOLD_EGRESS=proxy or BLINDFOLD_EXEC_ANY_SECRET=1."
+    return 1
+  fi
   [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
 
   if egress_enabled; then
@@ -334,8 +343,31 @@ is_private_path() {
   path_is_inside "$1" "$PRIVATE_REAL"
 }
 
+# Reads SETTINGS_FILE. Sets BLINDFOLD_EGRESS=proxy when it turns lockdown on,
+# and EXEC_ANY_SECRET when it turns secret-exec.sh's refusal off. A file it
+# can't make sense of turns lockdown on and sets SETTINGS_ERROR, so commands
+# are refused until it's fixed rather than run with a guess.
+read_settings() {
+  local line key value
+  EXEC_ANY_SECRET="" SETTINGS_ERROR=""
+  [[ -f "$SETTINGS_FILE" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    key="${line%%=*}" value="${line#*=}"
+    case "${key}=${value}" in
+      BLINDFOLD_EGRESS=proxy) BLINDFOLD_EGRESS=proxy ;;
+      BLINDFOLD_EGRESS=) ;;
+      BLINDFOLD_EXEC_ANY_SECRET=1) EXEC_ANY_SECRET=1 ;;
+      BLINDFOLD_EXEC_ANY_SECRET=0 | BLINDFOLD_EXEC_ANY_SECRET=) ;;
+      *) SETTINGS_ERROR="Line '${line}' in ${SETTINGS_FILE} is not a setting Blindfold knows." ;;
+    esac
+  done <"$SETTINGS_FILE"
+  [[ -z "$SETTINGS_ERROR" ]] || BLINDFOLD_EGRESS=proxy
+}
+read_settings
+
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
-EGRESS_SETUP_HINT="Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
+EGRESS_SETUP_HINT="Build it with scripts/build-proxy.sh in your own terminal, or turn lockdown off."
 
 check_dependencies() {
   if ! command -v jq &>/dev/null; then

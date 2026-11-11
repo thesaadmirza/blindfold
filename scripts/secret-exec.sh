@@ -49,13 +49,12 @@ NAMES=$(echo "$COMMAND" | grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' | tr -d '{}'
 # Set up the sandbox before reading any value. Under egress lockdown this also
 # says which secrets have a policy: those go through the proxy, which only
 # sends them to their own hosts, so they're never put into a command here.
-# BLINDFOLD_EXEC_ANY_SECRET=1 in Claude Code's environment turns this off
-# while migrating. A command that sets it inline loses its exemption and runs
-# sandboxed, away from the keychain, but this is a convenience switch, not a
-# barrier: see SECURITY.md on Claude Code's settings.
+# BLINDFOLD_EXEC_ANY_SECRET=1 in Blindfold's settings file turns this off
+# while migrating. It's read from the file only, never the environment, so the
+# agent can't set it: under lockdown it can't write the file.
 build_sandbox_argv || { echo "ERROR: ${EGRESS_SETUP_ERROR} ${EGRESS_SETUP_HINT}" >&2; exit 1; }
 while IFS= read -r name; do
-  [[ -n "$name" && -z "${BLINDFOLD_EXEC_ANY_SECRET:-}" && " ${POLICY_NAMES[*]-} " == *" ${name} "* ]] || continue
+  [[ -n "$name" && -z "$EXEC_ANY_SECRET" && " ${POLICY_NAMES[*]-} " == *" ${name} "* ]] || continue
   echo "ERROR: ${name} has a policy, so secret-exec.sh won't put its value into a command." >&2
   echo "Run the command directly instead, with {{${name}}} or \$${name} where the value goes." >&2
   echo "The proxy fills it in on the way to the hosts its policy allows." >&2
