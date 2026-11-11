@@ -38,6 +38,8 @@ var testValues = map[string]string{
 	"GITLAB_TOKEN":      tokenValue,
 	"REGISTRY_PASSWORD": "registry-real-pass",
 	"MAPS_KEY":          "maps-real-key",
+	// A project's own value, under its scope
+	projectA + ":PROJECT_KEY": projectValue,
 }
 
 // seen is what a fake server received
@@ -162,7 +164,7 @@ func newHarness(t *testing.T, allowedHandler http.HandlerFunc) *harness {
 	webRoots.AddCert(webCA.cert)
 	h.proxy.transport.TLSClientConfig = &tls.Config{RootCAs: webRoots}
 
-	ca, err := h.proxy.SetPolicy(testPolicy)
+	ca, err := h.proxy.SetPolicies(testPolicy, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +195,12 @@ func (h *harness) clientFor(token string) *http.Client {
 
 func (h *harness) do(req *http.Request) *http.Response {
 	h.t.Helper()
-	resp, err := h.client.Do(req)
+	return h.send(h.client, req)
+}
+
+func (h *harness) send(c *http.Client, req *http.Request) *http.Response {
+	h.t.Helper()
+	resp, err := c.Do(req)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -367,7 +374,7 @@ func TestPlainHTTPIsNeverFilled(t *testing.T) {
 func TestMissingValueFailsTheRequest(t *testing.T) {
 	h := newHarness(t, nil)
 	pol := &Policy{Secrets: map[string]*Rule{"UNSTORED": {Hosts: []string{allowedHost}, Header: "X-Key"}}}
-	if _, err := h.proxy.SetPolicy(pol); err != nil {
+	if _, err := h.proxy.SetPolicies(pol, nil); err != nil {
 		t.Fatal(err)
 	}
 	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
@@ -397,11 +404,11 @@ func TestRequestWithoutPlaceholdersIsForwardedUnchanged(t *testing.T) {
 
 func TestCAIsMadeAgainOnlyWhenHostsChange(t *testing.T) {
 	p := NewProxy(func(Entry) {}, nil)
-	first, _ := p.SetPolicy(testPolicy)
+	first, _ := p.SetPolicies(testPolicy, nil)
 
-	same, _ := p.SetPolicy(&Policy{Secrets: map[string]*Rule{"X": {Hosts: []string{allowedHost}, Header: "X"}}})
-	other, _ := p.SetPolicy(&Policy{Secrets: map[string]*Rule{"X": {Hosts: []string{"other.example"}, Header: "X"}}})
-	none, _ := p.SetPolicy(&Policy{})
+	same, _ := p.SetPolicies(&Policy{Secrets: map[string]*Rule{"X": {Hosts: []string{allowedHost}, Header: "X"}}}, nil)
+	other, _ := p.SetPolicies(&Policy{Secrets: map[string]*Rule{"X": {Hosts: []string{"other.example"}, Header: "X"}}}, nil)
+	none, _ := p.SetPolicies(&Policy{}, nil)
 
 	if same != first || other == first || none != nil {
 		t.Fatalf("first=%p same=%p other=%p none=%p", first, same, other, none)
@@ -441,8 +448,6 @@ const (
 	projectValue = "project-a-real-value"
 )
 
-func init() { testValues[projectA+":PROJECT_KEY"] = projectValue }
-
 // withProject adds project A's approved policy, on the same host so the CA
 // the harness's clients trust stays the same
 func (h *harness) withProject(rules map[string]*Rule) {
@@ -457,16 +462,6 @@ func projectKeyRequest(t *testing.T) *http.Request {
 	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
 	req.Header.Set("X-Project-Key", "{{PROJECT_KEY}}")
 	return req
-}
-
-func (h *harness) send(c *http.Client, req *http.Request) {
-	h.t.Helper()
-	resp, err := c.Do(req)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
 }
 
 func TestProjectTokenAddsTheProjectsRules(t *testing.T) {
@@ -511,5 +506,19 @@ func TestProjectCannotChangeAGlobalRule(t *testing.T) {
 	got := h.only(h.allowed)
 	if got.Header.Get("X-Leak") != "{{GITLAB_TOKEN}}" || got.Header.Get("Private-Token") != tokenValue {
 		t.Fatalf("X-Leak = %q, Private-Token = %q", got.Header.Get("X-Leak"), got.Header.Get("Private-Token"))
+	}
+}
+
+// A global secret is looked up in the global scope even for a project's request
+func TestGlobalSecretsAreLookedUpGlobally(t *testing.T) {
+	h := newHarness(t, nil)
+	h.withProject(map[string]*Rule{"PROJECT_KEY": {Hosts: []string{allowedHost}, Header: "X-Project-Key"}})
+	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
+	req.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
+
+	h.send(h.clientFor(tokenA), req)
+
+	if !slices.Equal(h.scopes, []string{""}) {
+		t.Fatalf("looked up in scopes %q", h.scopes)
 	}
 }

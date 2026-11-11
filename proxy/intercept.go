@@ -18,7 +18,7 @@ import (
 // intercept terminates TLS for a policy host with a certificate from the local
 // CA, then checks and forwards each request on the connection. It is the only
 // place a real value is ever put into traffic.
-func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, rules map[string]*Rule, scope string, ca *authority) {
+func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, rules map[string]*Rule, scopes map[string]string, ca *authority) {
 	cert, err := ca.leaf(host)
 	if err != nil {
 		http.Error(w, "cannot intercept", http.StatusInternalServerError)
@@ -52,7 +52,7 @@ func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, r
 		ErrorLog:  log.New(io.Discard, "", 0),
 	}
 	srv := &http.Server{
-		Handler:           p.checkAndInject(host, rules, scope, forwarder),
+		Handler:           p.checkAndInject(host, rules, scopes, forwarder),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          log.New(io.Discard, "", 0),
@@ -62,8 +62,8 @@ func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, r
 	srv.Serve(&oneConnListener{conn: tlsConn})
 }
 
-func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scope string, forwarder http.Handler) http.Handler {
-	lookup := func(name string) (string, error) { return p.lookup(scope, name) }
+func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[string]string, forwarder http.Handler) http.Handler {
+	lookup := func(name string) (string, error) { return p.lookup(scopes[name], name) }
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e := Entry{Kind: "https", Host: host, Method: r.Method}
 		start := time.Now()

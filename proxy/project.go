@@ -95,7 +95,12 @@ func projectsStamp(private string) string {
 	fmt.Fprint(&b, stamp(tokensFile(private)))
 	for _, token := range slices.Sorted(maps.Keys(tokens)) {
 		e := tokens[token]
-		fmt.Fprint(&b, "|", e.id, stamp(trustedFile(private, e.id)), stamp(filepath.Join(e.path, ProjectPolicyFile)))
+		trusted := stamp(trustedFile(private, e.id))
+		fmt.Fprint(&b, "|", e.id, trusted)
+		// Without an approved copy the project's own file can't matter
+		if trusted != "missing" {
+			fmt.Fprint(&b, stamp(filepath.Join(e.path, ProjectPolicyFile)))
+		}
 	}
 	return b.String()
 }

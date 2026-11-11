@@ -53,21 +53,21 @@ type policyState struct {
 }
 
 // rulesFor returns the rules for host that apply to a request carrying token,
-// and the project to look secrets up in ("" for global only). A project adds
-// rules for names the global policy doesn't have; it can't change a global
-// secret's rule.
-func (st *policyState) rulesFor(token, host string) (map[string]*Rule, string) {
-	rules := st.policy.RulesFor(host)
+// and the scope to look each secret up in: none for the global policy's
+// secrets, the project's path for its own. A project only adds rules for names
+// the global policy doesn't have; it can't change a global secret's rule.
+func (st *policyState) rulesFor(token, host string) (map[string]*Rule, map[string]string) {
+	rules, scopes := st.policy.RulesFor(host), map[string]string{}
 	proj := st.projects[token]
 	if proj == nil {
-		return rules, ""
+		return rules, scopes
 	}
 	for name, r := range proj.Policy.RulesFor(host) {
 		if _, global := st.policy.Secrets[name]; !global {
-			rules[name] = r
+			rules[name], scopes[name] = r, proj.Path
 		}
 	}
-	return rules, proj.Path
+	return rules, scopes
 }
 
 // NewProxy returns a proxy with an empty policy. lookup returns the stored
@@ -90,9 +90,6 @@ func NewProxy(record func(Entry), lookup func(scope, name string) (string, error
 	p.state.Store(&policyState{policy: &Policy{}})
 	return p
 }
-
-// SetPolicy switches to a global policy with no projects
-func (p *Proxy) SetPolicy(pol *Policy) (*authority, error) { return p.SetPolicies(pol, nil) }
 
 // SetPolicies switches to a global policy and a set of approved projects. The
 // CA covers every host any of them names, and is made again only when that
@@ -134,8 +131,8 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		host = strings.ToLower(host)
 		// SetPolicies makes a CA whenever any rule names a host
 		st := p.state.Load()
-		if rules, scope := st.rulesFor(proxyToken(r), host); len(rules) > 0 {
-			p.intercept(w, r, host, rules, scope, st.ca)
+		if rules, scopes := st.rulesFor(proxyToken(r), host); len(rules) > 0 {
+			p.intercept(w, r, host, rules, scopes, st.ca)
 			return
 		}
 	}

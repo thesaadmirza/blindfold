@@ -38,16 +38,18 @@ func main() {
 	flag.Parse()
 
 	if *check != "" {
+		// Not LoadPolicy: a missing file is an error here, not an empty policy
 		data, err := os.ReadFile(*check)
+		var pol *Policy
 		if err == nil {
-			var pol *Policy
-			if pol, err = ParsePolicy(data); err == nil {
-				fmt.Println(strings.Join(pol.Names(), "\n"))
-				return
-			}
+			pol, err = ParsePolicy(data)
 		}
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(strings.Join(pol.Names(), "\n"))
+		return
 	}
 
 	ln, err := listenLoopback(*listen)
