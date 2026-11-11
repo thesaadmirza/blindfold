@@ -74,14 +74,8 @@ def _ca_bundle(env) -> Path:
     return _port_file(env).parent / "ca-bundle.pem"
 
 
-def _write_policy(env, body):
-    path = _config_dir(env) / "policy.toml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body)
-
-
-def _write_settings(env, body):
-    path = _config_dir(env) / "settings"
+def _write_config(env, name, body):
+    path = _config_dir(env) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
 
@@ -104,7 +98,8 @@ def _env_words(wrapped):
 @pytest.fixture()
 def egress_env(tmp_path, temp_registry, proxy_bin):
     env = os.environ.copy()
-    env.pop("BLINDFOLD_KEYCHAIN", None)
+    for var in ("BLINDFOLD_KEYCHAIN", "CLAUDE_CONFIG_DIR", "ZDOTDIR"):
+        env.pop(var, None)
     env.update({
         "BLINDFOLD_EGRESS": "proxy",
         "BLINDFOLD_PROXY_BIN": str(proxy_bin),
@@ -155,22 +150,19 @@ class TestEgressWiring:
         assert str(BASE_PROFILE) in wrapped
         assert "HTTPS_PROXY" not in wrapped
 
-    def test_settings_file_turns_lockdown_on(self, egress_env):
+    @pytest.mark.parametrize("env_value", [None, ""], ids=["unset", "set-empty"])
+    def test_settings_file_turns_lockdown_on_whatever_the_environment_says(self, egress_env, env_value):
         egress_env.pop("BLINDFOLD_EGRESS")
-        _write_settings(egress_env, "# Blindfold\nBLINDFOLD_EGRESS=proxy\n")
-
-        assert str(EGRESS_PROFILE) in wrap_through_guard("echo hi", egress_env)
-
-    def test_environment_cannot_turn_off_what_the_settings_file_turned_on(self, egress_env):
-        egress_env["BLINDFOLD_EGRESS"] = ""
-        _write_settings(egress_env, "BLINDFOLD_EGRESS=proxy\n")
+        if env_value is not None:
+            egress_env["BLINDFOLD_EGRESS"] = env_value
+        _write_config(egress_env, "settings", "# Blindfold\nBLINDFOLD_EGRESS=proxy\n")
 
         assert str(EGRESS_PROFILE) in wrap_through_guard("echo hi", egress_env)
 
     @pytest.mark.parametrize("line", ["BLINDFOLD_EGRESS=off", "BLINDFOLD_EGRESS = proxy", "EGRESS=proxy"])
     def test_a_setting_blindfold_does_not_know_is_refused(self, egress_env, line):
         egress_env.pop("BLINDFOLD_EGRESS")
-        _write_settings(egress_env, line + "\n")
+        _write_config(egress_env, "settings", line + "\n")
 
         result = run_guard(build_guard_input("echo hi"), egress_env)
 
@@ -183,11 +175,7 @@ class TestEgressWiring:
         assert f"CONFIG_DIR={_config_dir(egress_env).resolve()}" in wrapped
         assert f"INSTALL_DIR={SCRIPTS_DIR.parent.resolve()}" in wrapped
 
-    def test_sandbox_is_told_about_claude_settings_and_their_folders(self, egress_env, tmp_path):
-        home = tmp_path / "home"
-        home.mkdir()
-        egress_env["HOME"] = str(home)
-
+    def test_sandbox_is_told_about_claude_settings_and_their_folders(self, egress_env, home):
         words = shlex.split(wrap_through_guard("echo hi", egress_env))
         params = dict(words[i + 1].split("=", 1) for i, w in enumerate(words) if w == "-D")
 
@@ -214,7 +202,7 @@ class TestEgressWiring:
         assert "{{" not in wrapped
 
     def test_policy_secrets_get_placeholders_and_the_ca(self, egress_env):
-        _write_policy(egress_env, POLICY)
+        _write_config(egress_env, "policy.toml", POLICY)
 
         wrapped = wrap_through_guard("echo hi", egress_env)
 
@@ -225,7 +213,7 @@ class TestEgressWiring:
         assert bundle.read_text().count("BEGIN CERTIFICATE") >= 2, "bundle is missing the roots or the CA"
 
     def test_secret_exec_refuses_a_secret_with_a_policy(self, egress_env):
-        _write_policy(egress_env, POLICY)
+        _write_config(egress_env, "policy.toml", POLICY)
 
         result = run_script("secret-exec.sh", ['curl -H "X-Test-Token: {{BFTEST_TOKEN}}" https://example.com/'],
                             env=egress_env)
@@ -236,7 +224,7 @@ class TestEgressWiring:
 
     def test_refusal_cannot_be_turned_off_from_the_environment(self, egress_env):
         # Only the settings file counts, which the agent can't write
-        _write_policy(egress_env, POLICY)
+        _write_config(egress_env, "policy.toml", POLICY)
         egress_env["BLINDFOLD_EXEC_ANY_SECRET"] = "1"
 
         result = run_script("secret-exec.sh", ["echo {{BFTEST_TOKEN}}"], env=egress_env)
@@ -256,7 +244,7 @@ class TestEgressWiring:
 
     def test_a_policy_secret_cannot_shadow_what_the_guard_sets(self, egress_env):
         # The guard sets these itself, so proxy/policy.go must refuse them as names
-        _write_policy(egress_env, POLICY)
+        _write_config(egress_env, "policy.toml", POLICY)
         own = {w.split("=", 1)[0].upper() for w in _env_words(wrap_through_guard("echo hi", egress_env))
                if not w.endswith("}}")}
         go = (SCRIPTS_DIR.parent / "proxy" / "policy.go").read_text()
@@ -265,7 +253,7 @@ class TestEgressWiring:
         assert own <= reserved, f"missing from reservedNames in policy.go: {sorted(own - reserved)}"
 
     def test_invalid_policy_is_denied_with_the_reason(self, egress_env):
-        _write_policy(egress_env, '[secrets.X]\nhosts = ["*.example.com"]\nheader = "X"\n')
+        _write_config(egress_env, "policy.toml", '[secrets.X]\nhosts = ["*.example.com"]\nheader = "X"\n')
 
         result = run_guard(build_guard_input("echo hi"), egress_env)
 
@@ -297,6 +285,15 @@ class TestEgressWiring:
 
 
 PROJECT_POLICY = '[secrets.BFTEST_PROJECT]\nhosts = ["example.org"]\nheader = "X-Project"\n'
+
+
+@pytest.fixture()
+def home(tmp_path, egress_env):
+    """A home folder of the test's own, so the guard never looks at the real one"""
+    folder = tmp_path / "home"
+    (folder / ".claude").mkdir(parents=True)
+    egress_env["HOME"] = str(folder)
+    return folder
 
 
 @pytest.fixture()
@@ -522,8 +519,8 @@ class TestEgressRuntime:
         # migrating, is still filled in and redacted the old way
         _store_test_secret(egress_env, temp_keychain)
         if opt_out:
-            _write_policy(egress_env, POLICY)
-            _write_settings(egress_env, "BLINDFOLD_EXEC_ANY_SECRET=1\n")
+            _write_config(egress_env, "policy.toml", POLICY)
+            _write_config(egress_env, "settings", "BLINDFOLD_EXEC_ANY_SECRET=1\n")
 
         result = run_script("secret-exec.sh", ["echo got {{BFTEST_TOKEN}}"], env=egress_env)
 
@@ -543,31 +540,29 @@ class TestEgressRuntime:
         finally:
             script.unlink(missing_ok=True)
 
-    def test_commands_cannot_change_claude_settings_or_profiles(self, egress_env, tmp_path, project):
-        home = tmp_path / "home"
-        (home / ".claude" / "plugins").mkdir(parents=True)
+    def test_commands_cannot_change_claude_settings_or_profiles(self, egress_env, tmp_path, home, project):
+        (home / ".claude" / "plugins").mkdir()
         (project / ".claude").mkdir()
         dotfiles = tmp_path / "dotfiles"
         dotfiles.mkdir()
         (dotfiles / "zshrc").write_text("original\n")
         (home / ".zshrc").symlink_to(dotfiles / "zshrc")
         (home / ".claude" / "settings.json").write_text("{}")
-        egress_env["HOME"] = str(home)
-        attempts = {
-            "user settings": f"echo x > {home}/.claude/settings.json",
-            "local settings": f"echo x > {home}/.claude/settings.local.json",
-            "plugins": f"echo x > {home}/.claude/plugins/installed_plugins.json",
-            "symlinked profile": f"echo x >> {home}/.zshrc",
-            "new profile": f"echo x > {home}/.bash_profile",
-            "project settings": f"echo x > {project}/.claude/settings.local.json",
-            "settings elsewhere": f"mkdir -p {tmp_path}/other/.claude && echo x > {tmp_path}/other/.claude/settings.json",
-            "moving .claude away": f"mv {home}/.claude {home}/old-claude",
-            "moving the project's .claude": f"mv {project}/.claude {project}/old-claude",
-            "moving the config's parent": f"mv {_config_dir(egress_env).parent} {tmp_path}/moved",
-            "removing the profile link": f"rm {home}/.zshrc",
-        }
+        attempts = [
+            f"echo x > {home}/.claude/settings.json",
+            f"echo x > {home}/.claude/settings.local.json",
+            f"echo x > {home}/.claude/plugins/installed_plugins.json",
+            f"echo x >> {home}/.zshrc",
+            f"echo x > {home}/.bash_profile",
+            f"echo x > {project}/.claude/settings.local.json",
+            f"mkdir -p {tmp_path}/other/.claude && echo x > {tmp_path}/other/.claude/settings.json",
+            f"mv {home}/.claude {home}/old-claude",
+            f"mv {project}/.claude {project}/old-claude",
+            f"mv {_config_dir(egress_env).parent} {tmp_path}/moved",
+            f"rm {home}/.zshrc",
+        ]
 
-        for what, cmd in attempts.items():
+        for cmd in attempts:
             execute_wrapped(wrap_through_guard(cmd, egress_env, cwd=project))
 
         assert (dotfiles / "zshrc").read_text() == "original\n"
@@ -581,10 +576,7 @@ class TestEgressRuntime:
         assert not (home / "old-claude").exists() and not (project / "old-claude").exists()
         assert not (tmp_path / "moved").exists()
 
-    def test_commands_can_still_write_beside_claude_settings(self, egress_env, tmp_path, project):
-        home = tmp_path / "home"
-        (home / ".claude").mkdir(parents=True)
-        egress_env["HOME"] = str(home)
+    def test_commands_can_still_write_beside_claude_settings(self, egress_env, home, project):
         cmd = (f"echo x > {home}/notes.txt && mkdir -p {home}/.claude/commands && echo x > {home}/.claude/commands/a.md"
                f" && mkdir {project}/.claude && echo x > {project}/.claude/notes.md")
 
@@ -623,7 +615,7 @@ class TestEgressRuntime:
 
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     def test_policy_host_is_intercepted_and_trusted(self, egress_env):
-        _write_policy(egress_env, POLICY)
+        _write_config(egress_env, "policy.toml", POLICY)
 
         result = execute_wrapped(wrap_through_guard(CURL_EXAMPLE.format(extra=""), egress_env))
 
@@ -634,7 +626,7 @@ class TestEgressRuntime:
     @pytest.mark.parametrize("header", ["{{BFTEST_TOKEN}}", "$BFTEST_TOKEN"], ids=["placeholder", "env-var"])
     def test_placeholder_is_filled_from_the_keychain(self, egress_env, temp_keychain, header):
         _store_test_secret(egress_env, temp_keychain)
-        _write_policy(egress_env, POLICY)
+        _write_config(egress_env, "policy.toml", POLICY)
         cmd = CURL_EXAMPLE.format(extra=f'-H "X-Test-Token: {header}"')
 
         result = execute_wrapped(wrap_through_guard(cmd, egress_env))
