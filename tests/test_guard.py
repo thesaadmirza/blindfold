@@ -221,6 +221,34 @@ class TestBlindfoldFilesAreProtected:
 
         assert self._edit(self.dir / "linked.js", "Edit").returncode == 0
 
+    def test_any_project_policy_is_refused(self):
+        assert self._edit(self.dir / "some-project" / ".blindfold.toml").returncode == 2
+
+    def test_symlink_to_a_project_policy_is_refused(self):
+        project = self.dir / "proj"
+        project.mkdir()
+        (project / ".blindfold.toml").write_text("")
+        (self.dir / "notes.toml").symlink_to(project / ".blindfold.toml")
+
+        assert self._edit(self.dir / "notes.toml", "Edit").returncode == 2
+
+    @pytest.mark.parametrize("tool,key", [("Read", "file_path"), ("Grep", "path")])
+    def test_private_folder_cannot_be_read_or_searched(self, tool, key):
+        private = self.config / "private"
+        private.mkdir()
+        (private / "tokens.tsv").write_text("secret-token\tid\t/x\n")
+        target = private / "tokens.tsv" if tool == "Read" else private
+
+        result = run_guard(json.dumps({"tool_name": tool, "tool_input": {key: str(target)}}), self.env)
+
+        assert result.returncode == 2, f"stderr={result.stderr!r}"
+        assert "secret-token" not in result.stderr
+
+    def test_grep_elsewhere_is_allowed(self):
+        result = run_guard(json.dumps({"tool_name": "Grep", "tool_input": {"path": str(self.dir)}}), self.env)
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+
     @pytest.mark.parametrize("name", ["notes.md", "sub/new.py"])
     def test_ordinary_files_are_allowed(self, name):
         result = self._edit(self.dir / "project" / name)

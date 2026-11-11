@@ -23,6 +23,10 @@ PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-${CONFIG_DIR}/run/proxy.port}"
 CA_BUNDLE="${PROXY_PORT_FILE%/*}/ca-bundle.pem"
 # What the running proxy loaded: "ok" or "error", then the secret names
 POLICY_STATE="${PROXY_PORT_FILE%/*}/policy.state"
+# Project tokens and approved project policies. Sandboxed commands can neither
+# read nor write it.
+PRIVATE_DIR="${CONFIG_DIR}/private"
+PROJECT_POLICY_FILE=".blindfold.toml"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
@@ -159,39 +163,59 @@ protected_dirs() {
   done
 }
 
-# True when path, once symlinks and .. are resolved, is inside CONFIG_DIR or
-# INSTALL_DIR. The agent's file tools go through this, since they run outside
-# the sandbox.
-is_protected_path() {
-  local path="$1" rest="" dir target hops links inode real protected
-  protected_dirs
-  # Follow a symlink at the end, a few hops at most
+# Sets RESOLVED_PATH to path with symlinks and .. resolved, following a
+# symlink at the end a few hops at most. Fails when a .. sits in a part that
+# doesn't exist yet, which can't be resolved here.
+resolve_path() {
+  local path="$1" rest="" dir target hops
   for ((hops = 0; hops < 8; hops++)); do
     [[ -L "$path" ]] || break
     target=$(readlink "$path")
     [[ "$target" == /* ]] && path="$target" || path="${path%/*}/${target}"
   done
-  # Resolve the deepest part that exists. A .. in the part that doesn't exist
-  # yet can't be resolved here, so treat it as protected rather than guess.
   dir="$path"
   while [[ -n "$dir" && ! -d "$dir" ]]; do
     rest="/${dir##*/}${rest}"
     [[ "$dir" == */* ]] && dir="${dir%/*}" || dir="."
   done
-  [[ "$rest" == */../* || "$rest" == */.. ]] && return 0
-  real="$(cd "${dir:-/}" 2>/dev/null && pwd -P)${rest}"
-  for protected in "${PROTECTED_DIRS[@]}"; do
-    [[ "$real" == "$protected" || "$real" == "$protected"/* ]] && return 0
+  [[ "$rest" == */../* || "$rest" == */.. ]] && return 1
+  RESOLVED_PATH="$(cd "${dir:-/}" 2>/dev/null && pwd -P)${rest}"
+}
+
+# True when path resolves into one of the given dirs, or is a hard link to a
+# file in one. A path that can't be resolved counts as inside, rather than
+# guessing.
+path_is_inside() {
+  local path="$1" dir links inode
+  shift
+  resolve_path "$path" || return 0
+  for dir in "$@"; do
+    [[ "$RESOLVED_PATH" == "$dir" || "$RESOLVED_PATH" == "$dir"/* ]] && return 0
   done
-  # A hard link made inside the sandbox could give a protected file a second
-  # name. Only multiply-linked files need the (slower) inode search.
-  [[ -f "$path" ]] || return 1
+  # A hard link made inside the sandbox could give a file a second name. Only
+  # multiply-linked files need the (slower) inode search.
+  [[ -f "$RESOLVED_PATH" ]] || return 1
   # GNU stat first: on Linux `stat -f` means file system status and succeeds
   # with unrelated output, while BSD stat simply rejects -c
-  read -r links inode < <(stat -c '%h %i' "$path" 2>/dev/null || stat -f '%l %i' "$path" 2>/dev/null)
-  [[ "$links" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ ]] || return 1
-  [[ "$links" -gt 1 ]] || return 1
-  [[ -n "$(find "${PROTECTED_DIRS[@]}" -xdev -inum "$inode" -print -quit 2>/dev/null)" ]]
+  read -r links inode < <(stat -c '%h %i' "$RESOLVED_PATH" 2>/dev/null || stat -f '%l %i' "$RESOLVED_PATH" 2>/dev/null)
+  [[ "$links" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ && "$links" -gt 1 ]] || return 1
+  [[ -n "$(find "$@" -xdev -inum "$inode" -print -quit 2>/dev/null)" ]]
+}
+
+# True for Blindfold's config and code, and for any project's .blindfold.toml.
+# The agent's file tools go through this, since they run outside the sandbox.
+is_protected_path() {
+  protected_dirs
+  [[ "${1##*/}" == "$PROJECT_POLICY_FILE" ]] && return 0
+  path_is_inside "$1" "${PROTECTED_DIRS[@]}" && return 0
+  [[ "${RESOLVED_PATH##*/}" == "$PROJECT_POLICY_FILE" ]]
+}
+
+# True for the private folder, where reading a project token would let the
+# agent pass for that project
+is_private_path() {
+  protected_dirs
+  path_is_inside "$1" "${PROTECTED_DIRS[0]}/private"
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
