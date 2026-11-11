@@ -125,7 +125,7 @@ header  = "PRIVATE-TOKEN"
 approve = "writes"      # never (the default), writes, or always
 ```
 
-`writes` asks before any request that isn't a GET or HEAD, and `always` asks before every one. The request waits, before the value is sent anywhere, while a Blindfold dialog shows you the secret, method, host and path. Choose Deny, Allow once, or Allow 30 min, which covers that secret, method and host for half an hour so routine work doesn't turn into a stream of prompts. Deny is the default button, and no answer within 60 seconds counts as Deny. When the agent repeats a request while you're still deciding, those copies wait for the same answer instead of opening more dialogs.
+`writes` asks before any request that isn't a GET or HEAD, and `always` asks before every one. The request waits, before the value is sent anywhere, while a Blindfold dialog shows you the secret, method, host and path. Choose Allow 30 min, Allow once, or Deny (the rightmost button), which covers that secret, method and host for half an hour so routine work doesn't turn into a stream of prompts. Deny is the default button, and no answer within 60 seconds counts as Deny. When the agent repeats a request while you're still deciding, those copies wait for the same answer instead of opening more dialogs.
 
 The path in the dialog comes from the agent, so it's shortened and shown on a line marked as the request path. If that line reads like advice about which button to press, that's the agent talking, not Blindfold.
 

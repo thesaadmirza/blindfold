@@ -125,7 +125,7 @@ The proxy shows a native dialog. For example: "An agent wants to use GITLAB_TOKE
 
 No answer within 60 seconds counts as a deny. The 30-minute grant is what keeps this from becoming a wall of prompts people click through without reading.
 
-As built, the buttons read Deny, Allow once and Allow 30 min, with Deny the default and the cancel button, and a grant is also scoped to the project. One dialog is on screen at a time, and copies of a request that arrive while it's being decided wait for the same answer, so an agent retrying in a loop can't stack up dialogs. The request path in the dialog is text the agent chose, so it's cut to 120 characters with control characters removed. A refusal is logged as `refused-approval`, and a `filled` line says how it was approved.
+As built, the buttons read Allow 30 min, Allow once and Deny, left to right. Deny is drawn rightmost, where a reflex click lands, and it's the default and the cancel button. A first real-world try with Deny on the left ended in two accidental approvals, which is how it got moved. A grant is also scoped to the project. One dialog is on screen at a time, and copies of a request that arrive while it's being decided wait for the same answer, so an agent retrying in a loop can't stack up dialogs. The request path in the dialog is text the agent chose, so it's cut to 120 characters with control characters removed. A refusal is logged as `refused-approval`, and a `filled` line says how it was approved.
 
 ## Audit log
 
