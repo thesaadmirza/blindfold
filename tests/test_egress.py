@@ -183,6 +183,24 @@ class TestEgressWiring:
         assert f"CONFIG_DIR={_config_dir(egress_env).resolve()}" in wrapped
         assert f"INSTALL_DIR={SCRIPTS_DIR.parent.resolve()}" in wrapped
 
+    def test_sandbox_is_told_about_claude_settings_and_their_folders(self, egress_env, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        egress_env["HOME"] = str(home)
+
+        words = shlex.split(wrap_through_guard("echo hi", egress_env))
+        params = dict(words[i + 1].split("=", 1) for i, w in enumerate(words) if w == "-D")
+
+        settings = re.compile(params["CLAUDE_SETTINGS"])
+        parents = re.compile(params["PARENT_DIRS"])
+        real = home.resolve()
+        for kept in [".claude/settings.json", ".claude/plugins/x/y.json", ".zshrc", ".bash_profile"]:
+            assert settings.match(f"{real}/{kept}"), kept
+        assert not settings.match(f"{real}/.claude/CLAUDE.md")
+        for folder in [real, real / ".claude", _config_dir(egress_env).resolve().parent]:
+            assert parents.match(str(folder)), folder
+        assert not parents.match(f"{real}/.claude/projects")
+
     def test_egress_profile_keeps_every_base_rule(self):
         egress_rules = set(EGRESS_PROFILE.read_text().splitlines())
         missing = [line for line in BASE_PROFILE.read_text().splitlines() if line not in egress_rules]
@@ -455,7 +473,8 @@ def _egress_sandbox_applies() -> bool:
     # Evaluated at collection time on every platform, so check first
     if shutil.which("sandbox-exec") is None:
         return False
-    params = [f"{p}=/nonexistent" for p in ("CONFIG_DIR", "INSTALL_DIR", "PRIVATE_DIR", "PROJECT_POLICY")]
+    params = [f"{p}=/nonexistent" for p in ("CONFIG_DIR", "INSTALL_DIR", "PRIVATE_DIR", "PROJECT_POLICY",
+                                            "CLAUDE_SETTINGS", "PARENT_DIRS")]
     r = subprocess.run(["sandbox-exec", *[w for p in params for w in ("-D", p)],
                         "-f", str(EGRESS_PROFILE), "/usr/bin/true"],
                        capture_output=True, text=True)
@@ -523,6 +542,56 @@ class TestEgressRuntime:
             assert fine.exists(), f"ordinary writes broke: stderr={result.stderr!r}"
         finally:
             script.unlink(missing_ok=True)
+
+    def test_commands_cannot_change_claude_settings_or_profiles(self, egress_env, tmp_path, project):
+        home = tmp_path / "home"
+        (home / ".claude" / "plugins").mkdir(parents=True)
+        (project / ".claude").mkdir()
+        dotfiles = tmp_path / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "zshrc").write_text("original\n")
+        (home / ".zshrc").symlink_to(dotfiles / "zshrc")
+        (home / ".claude" / "settings.json").write_text("{}")
+        egress_env["HOME"] = str(home)
+        attempts = {
+            "user settings": f"echo x > {home}/.claude/settings.json",
+            "local settings": f"echo x > {home}/.claude/settings.local.json",
+            "plugins": f"echo x > {home}/.claude/plugins/installed_plugins.json",
+            "symlinked profile": f"echo x >> {home}/.zshrc",
+            "new profile": f"echo x > {home}/.bash_profile",
+            "project settings": f"echo x > {project}/.claude/settings.local.json",
+            "settings elsewhere": f"mkdir -p {tmp_path}/other/.claude && echo x > {tmp_path}/other/.claude/settings.json",
+            "moving .claude away": f"mv {home}/.claude {home}/old-claude",
+            "moving the project's .claude": f"mv {project}/.claude {project}/old-claude",
+            "moving the config's parent": f"mv {_config_dir(egress_env).parent} {tmp_path}/moved",
+            "removing the profile link": f"rm {home}/.zshrc",
+        }
+
+        for what, cmd in attempts.items():
+            execute_wrapped(wrap_through_guard(cmd, egress_env, cwd=project))
+
+        assert (dotfiles / "zshrc").read_text() == "original\n"
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".claude" / "settings.json").read_text() == "{}"
+        assert not (home / ".claude" / "settings.local.json").exists()
+        assert not (home / ".claude" / "plugins" / "installed_plugins.json").exists()
+        assert not (home / ".bash_profile").exists()
+        assert not (project / ".claude" / "settings.local.json").exists()
+        assert not (tmp_path / "other" / ".claude" / "settings.json").exists()
+        assert not (home / "old-claude").exists() and not (project / "old-claude").exists()
+        assert not (tmp_path / "moved").exists()
+
+    def test_commands_can_still_write_beside_claude_settings(self, egress_env, tmp_path, project):
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        egress_env["HOME"] = str(home)
+        cmd = (f"echo x > {home}/notes.txt && mkdir -p {home}/.claude/commands && echo x > {home}/.claude/commands/a.md"
+               f" && mkdir {project}/.claude && echo x > {project}/.claude/notes.md")
+
+        result = execute_wrapped(wrap_through_guard(cmd, egress_env, cwd=project))
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert (project / ".claude" / "notes.md").exists()
 
     def test_commands_cannot_read_project_tokens(self, egress_env, project):
         (project / ".blindfold.toml").write_text(PROJECT_POLICY)
