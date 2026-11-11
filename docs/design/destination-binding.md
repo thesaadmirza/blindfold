@@ -1,6 +1,6 @@
 # Design: binding secrets to their destinations
 
-Status: draft, 2026-11-10, updated 2026-11-11. Milestones 1 to 3 are built.
+Status: draft, 2026-11-10, updated 2026-11-11. Milestones 1 to 4 are built.
 
 ## The problem
 
@@ -125,6 +125,8 @@ The proxy shows a native dialog. For example: "An agent wants to use GITLAB_TOKE
 
 No answer within 60 seconds counts as a deny. The 30-minute grant is what keeps this from becoming a wall of prompts people click through without reading.
 
+As built, the buttons read Deny, Allow once and Allow 30 min, with Deny the default and the cancel button, and a grant is also scoped to the project. One dialog is on screen at a time, and copies of a request that arrive while it's being decided wait for the same answer, so an agent retrying in a loop can't stack up dialogs. The request path in the dialog is text the agent chose, so it's cut to 120 characters with control characters removed. A refusal is logged as `refused-approval`, and a `filled` line says how it was approved.
+
 ## Audit log
 
 Each line in `~/.local/state/blindfold/audit.jsonl` looks like this:
@@ -133,7 +135,7 @@ Each line in `~/.local/state/blindfold/audit.jsonl` looks like this:
 {"ts":"2026-11-10T16:40:02Z","secret":"GITLAB_TOKEN","session":"<hook session_id>","method":"POST","host":"gitlab.com","path":"/api/v4/projects/42/issues","status":201,"decision":"approved-session"}
 ```
 
-Query strings are left out of `path`, because they can carry data. Denied attempts are logged too. Those are the lines someone investigating an incident will want most. As built, the decisions are `filled`, `echoed`, `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `outside-slot` and `plain-http`, and a line names the project when a project's secret was used. The session id isn't logged, since the proxy doesn't see it. Wrong-method and approval decisions arrive with milestone 4. Hash-chaining the log can come later.
+Query strings are left out of `path`, because they can carry data. Denied attempts are logged too. Those are the lines someone investigating an incident will want most. As built, the decisions are `filled`, `echoed`, `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `outside-slot` and `plain-http`, and a line names the project when a project's secret was used. The session id isn't logged, since the proxy doesn't see it. Approval refusals are `refused-approval`, and a `filled` line notes how it was approved. Hash-chaining the log can come later.
 
 ## What stays the same
 
