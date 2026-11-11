@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -64,20 +65,33 @@ var forbiddenHeaders = []string{
 // LoadPolicy reads a policy file. A missing file is an empty policy, so
 // lockdown works before anyone writes one.
 func LoadPolicy(path string) (*Policy, error) {
-	p := &Policy{}
-	meta, err := toml.DecodeFile(path, p)
+	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return &Policy{}, nil
 	}
 	if err != nil {
+		return nil, err
+	}
+	p, err := ParsePolicy(data)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return p, nil
+}
+
+// ParsePolicy parses and checks a policy
+func ParsePolicy(data []byte) (*Policy, error) {
+	p := &Policy{}
+	meta, err := toml.Decode(string(data), p)
+	if err != nil {
+		return nil, err
 	}
 	// A typo like "hosst" must not silently drop a rule
 	if extra := meta.Undecoded(); len(extra) > 0 {
-		return nil, fmt.Errorf("%s: unknown key %q", path, extra[0].String())
+		return nil, fmt.Errorf("unknown key %q", extra[0].String())
 	}
 	if err := p.validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
 	return p, nil
 }

@@ -37,23 +37,42 @@ type Entry struct {
 // through untouched.
 type Proxy struct {
 	record    func(Entry)
-	lookup    func(name string) (string, error)
+	lookup    func(scope, name string) (string, error)
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
 	transport *http.Transport
 	forwarder *httputil.ReverseProxy
 	state     atomic.Pointer[policyState]
 }
 
-// policyState is swapped whole when the policy changes, so a request never
-// sees a policy from one version and a CA from another
+// policyState is swapped whole when a policy changes, so a request never sees
+// policies from one version and a CA from another
 type policyState struct {
-	policy *Policy
-	ca     *authority // nil when the policy names no hosts
+	policy   *Policy             // the global policy
+	projects map[string]*Project // approved projects, by token
+	ca       *authority          // nil when no policy names a host
+}
+
+// rulesFor returns the rules for host that apply to a request carrying token,
+// and the scope to look each secret up in: none for the global policy's
+// secrets, the project's path for its own. A project only adds rules for names
+// the global policy doesn't have; it can't change a global secret's rule.
+func (st *policyState) rulesFor(token, host string) (map[string]*Rule, map[string]string) {
+	rules, scopes := st.policy.RulesFor(host), map[string]string{}
+	proj := st.projects[token]
+	if proj == nil {
+		return rules, scopes
+	}
+	for name, r := range proj.Policy.RulesFor(host) {
+		if _, global := st.policy.Secrets[name]; !global {
+			rules[name], scopes[name] = r, proj.Path
+		}
+	}
+	return rules, scopes
 }
 
 // NewProxy returns a proxy with an empty policy. lookup returns the stored
-// value of a secret by name.
-func NewProxy(record func(Entry), lookup func(string) (string, error)) *Proxy {
+// value of a secret, preferring the project scope when one is given.
+func NewProxy(record func(Entry), lookup func(scope, name string) (string, error)) *Proxy {
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	p := &Proxy{record: record, lookup: lookup, dial: dialer.DialContext}
 	p.transport = &http.Transport{
@@ -72,12 +91,18 @@ func NewProxy(record func(Entry), lookup func(string) (string, error)) *Proxy {
 	return p
 }
 
-// SetPolicy switches to pol. The CA is made again only when the set of hosts
-// changes. Returns the CA now in use, or nil when the policy names no hosts.
-func (p *Proxy) SetPolicy(pol *Policy) (*authority, error) {
+// SetPolicies switches to a global policy and a set of approved projects. The
+// CA covers every host any of them names, and is made again only when that
+// set changes. Returns the CA now in use, or nil when no policy names a host.
+func (p *Proxy) SetPolicies(pol *Policy, projects map[string]*Project) (*authority, error) {
 	old := p.state.Load()
-	next := &policyState{policy: pol, ca: old.ca}
-	if hosts := pol.Hosts(); len(hosts) == 0 {
+	next := &policyState{policy: pol, projects: projects, ca: old.ca}
+	all := pol.Hosts()
+	for _, proj := range projects {
+		all = append(all, proj.Policy.Hosts()...)
+	}
+	slices.Sort(all)
+	if hosts := slices.Compact(all); len(hosts) == 0 {
 		next.ca = nil
 	} else if old.ca == nil || !slices.Equal(old.ca.hosts, hosts) {
 		ca, err := newAuthority(hosts)
@@ -104,10 +129,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 	if host, port, err := net.SplitHostPort(r.Host); err == nil && port == "443" {
 		host = strings.ToLower(host)
-		// SetPolicy makes a CA whenever any rule names a host
+		// SetPolicies makes a CA whenever any rule names a host
 		st := p.state.Load()
-		if rules := st.policy.RulesFor(host); len(rules) > 0 {
-			p.intercept(w, r, host, rules, st.ca)
+		if rules, scopes := st.rulesFor(proxyToken(r), host); len(rules) > 0 {
+			p.intercept(w, r, host, rules, scopes, st.ca)
 			return
 		}
 	}

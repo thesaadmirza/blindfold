@@ -13,7 +13,7 @@ INPUT=$(</dev/stdin)
 # Read each field on its own: @tsv would turn real newlines into a literal \n
 TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
 case "$TOOL_NAME" in
-  Bash | Read | Write | Edit | MultiEdit | NotebookEdit) ;;
+  Bash | Read | Grep | Write | Edit | MultiEdit | NotebookEdit) ;;
   *) exit 0 ;;
 esac
 
@@ -27,20 +27,29 @@ deny() {
   exit 2
 }
 
+# Read and Grep must stay out of the private folder: a project token read
+# there would let the agent pass for that project
+if [[ "$TOOL_NAME" == "Read" || "$TOOL_NAME" == "Grep" ]]; then
+  FILE_PATH=$(jq -r '.tool_input.file_path // .tool_input.path // ""' <<< "$INPUT" 2>/dev/null)
+  [[ -n "$FILE_PATH" ]] && is_private_path "$FILE_PATH" &&
+    deny "${FILE_PATH} holds Blindfold's private project tokens." "Nothing in it is meant for the agent."
+  [[ "$TOOL_NAME" == "Grep" ]] && exit 0
+fi
+
 # File tools run outside the sandbox, so the sandbox's write rules don't cover
-# them. Refuse edits to the policy, the proxy's files and Blindfold's scripts.
+# them. Refuse edits to Blindfold's config and scripts and to project policies.
 if [[ "$TOOL_NAME" != "Bash" && "$TOOL_NAME" != "Read" ]]; then
   FILE_PATH=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<< "$INPUT" 2>/dev/null)
   [[ -n "$FILE_PATH" ]] || exit 0
   is_protected_path "$FILE_PATH" &&
-    deny "${FILE_PATH} is Blindfold's own config or code." "Edit it yourself, outside the agent."
+    deny "${FILE_PATH} is Blindfold's own config or code, or a project policy." "Edit it yourself, outside the agent."
   exit 0
 fi
 
 # Read: refuse a file that contains any stored value, e.g. one a command wrote
 # a secret into. Checked before the read, since output can't be redacted after.
 if [[ "$TOOL_NAME" == "Read" ]]; then
-  FILE_PATH=$(jq -r '.tool_input.file_path // ""' <<< "$INPUT" 2>/dev/null)
+  # FILE_PATH was read above, with the private-folder check
   [[ -f "$FILE_PATH" && -r "$FILE_PATH" ]] || exit 0
 
   CONTENT=$(<"$FILE_PATH")

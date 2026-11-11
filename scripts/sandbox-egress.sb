@@ -6,6 +6,12 @@
 ; not in sandbox.sb because macOS won't apply a profile with file rules inside
 ; another sandbox, and the base profile has to keep working inside one.
 (deny file-write* (subpath (param "CONFIG_DIR")) (subpath (param "INSTALL_DIR")))
+; Project tokens live here. A command that could read them could pass for
+; another project and use that project's secrets.
+(deny file-read* (subpath (param "PRIVATE_DIR")))
+; The project's own policy only changes by the user's hand. An edit would just
+; need approving again, but this keeps the agent from asking for it.
+(deny file-write* (literal (param "PROJECT_POLICY")))
 ; Outbound traffic may only reach loopback, where the Blindfold proxy and any
 ; local dev servers listen. Everything else has to go through the proxy.
 (deny network-outbound)

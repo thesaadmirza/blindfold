@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -87,5 +88,21 @@ func TestBrokenPolicyTurnsInjectionOffAndSaysWhy(t *testing.T) {
 	}
 	if s := readFile(t, w.state); !strings.HasPrefix(s, "error\n") || !strings.Contains(s, "wildcards") {
 		t.Fatalf("state = %q", s)
+	}
+}
+
+func TestStateListsApprovedProjects(t *testing.T) {
+	w := newWatcher(t, validPolicy)
+	w.private, _ = setupProject(t, projectPolicy, projectPolicy)
+
+	if err := w.reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := readFile(t, w.state); s != "ok\nT\n@id1 PROJECT_KEY\n" {
+		t.Fatalf("state = %q", s)
+	}
+	if ca := w.proxy.state.Load().ca; !slices.Contains(ca.hosts, "api.example.com") {
+		t.Fatalf("CA hosts %v miss the project's host", ca.hosts)
 	}
 }

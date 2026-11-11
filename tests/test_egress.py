@@ -9,6 +9,7 @@ that is itself sandboxed).
 import http.server
 import json
 import os
+import pty
 import re
 import shlex
 import shutil
@@ -110,7 +111,7 @@ class TestEgressWiring:
 
         port = _port_file(egress_env).read_text().strip()
         assert str(EGRESS_PROFILE) in wrapped
-        assert f"HTTPS_PROXY=http://127.0.0.1:{port}" in wrapped
+        assert f"HTTPS_PROXY=http://127.0.0.1:{port}'" in wrapped
         assert "NO_PROXY=localhost,127.0.0.1,::1" in wrapped
 
     def test_a_running_proxy_is_reused(self, egress_env):
@@ -210,11 +211,185 @@ class TestEgressWiring:
         assert int(_pid_file(egress_env).read_text()) != old_pid
 
 
+PROJECT_POLICY = '[secrets.BFTEST_PROJECT]\nhosts = ["example.org"]\nheader = "X-Project"\n'
+
+
+@pytest.fixture()
+def project(tmp_path, egress_env):
+    """A project folder. A fake osascript goes first on PATH, so the real
+    approval script runs but no real dialog opens. It records the message and
+    answers with FAKE_DIALOG_REPLY (by default, no answer)."""
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fake = bin_dir / "osascript"
+    fake.write_text(f'#!/bin/bash\nprintf "%s" "${{@: -1}}" > {tmp_path / "dialog"}\n'
+                    'sleep "${FAKE_DIALOG_DELAY:-0}"\n'
+                    'echo "${FAKE_DIALOG_REPLY:-button returned:, gave up:true}"\n')
+    fake.chmod(0o755)
+    egress_env["PATH"] = f"{bin_dir}:{egress_env['PATH']}"
+    return folder.resolve()
+
+
+def _private(env) -> Path:
+    return _config_dir(env) / "private"
+
+
+def _token_line(env):
+    """token, id and path of the only project the guard has seen"""
+    lines = (_private(env) / "tokens.tsv").read_text().splitlines()
+    assert len(lines) == 1, lines
+    return lines[0].split("\t")
+
+
+def _wait_for(condition, what):
+    deadline = time.monotonic() + 5
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail(f"timed out waiting for {what}")
+        time.sleep(0.05)
+
+
+def _settle(env, project_id):
+    """Wait for the background approval script to finish with the pending copy"""
+    _wait_for(lambda: not (_private(env) / "pending" / f"{project_id}.toml").exists(), "the approval script")
+
+
+def _ask(env, project_dir):
+    """Run one command in the project; with a new policy that starts the dialog"""
+    result = run_guard(build_guard_input("echo hi"), env, cwd=project_dir)
+    _, project_id, _ = _token_line(env)
+    return result, project_id
+
+
+def _decide(env, project_id, body, decision):
+    """Record a decision the way secret-approve.sh does, and tell the proxy"""
+    folder = _private(env) / decision
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{project_id}.toml").write_text(body)
+    if decision == "trusted":
+        os.kill(int(_pid_file(env).read_text()), signal.SIGHUP)
+
+
+class TestProjectPolicies:
+
+    def _answer_in_a_terminal(self, env, project_dir, answer):
+        """Run secret-approve.sh with a terminal on stdin, as you would"""
+        main, child = pty.openpty()
+        proc = subprocess.Popen(["bash", str(SCRIPTS_DIR / "secret-approve.sh"), str(project_dir)],
+                                stdin=child, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+        os.close(child)
+        os.write(main, answer.encode())
+        out, err = proc.communicate(timeout=10)
+        os.close(main)
+        return out, err
+
+    def test_a_project_without_a_policy_gets_no_token(self, egress_env, project):
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        assert "blindfold:" not in wrapped
+        assert not (_private(egress_env) / "tokens.tsv").exists()
+
+    def test_sandbox_is_told_about_the_private_folder_and_the_project_policy(self, egress_env, project):
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        assert f"PRIVATE_DIR={_config_dir(egress_env).resolve()}/private" in wrapped
+        assert f"PROJECT_POLICY={project}/.blindfold.toml" in wrapped
+
+    def test_new_project_policy_waits_for_approval(self, egress_env, project, tmp_path):
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+
+        result, project_id = _ask(egress_env, project)
+
+        assert result.returncode == 2
+        assert "waiting for your approval" in result.stderr
+        token, _, path = _token_line(egress_env)
+        assert re.fullmatch(r"[0-9a-f]{32}", token) and re.fullmatch(r"[0-9a-f]{12}", project_id)
+        assert path == str(project)
+        assert oct((_private(egress_env) / "tokens.tsv").stat().st_mode & 0o777) == "0o600"
+        _wait_for((tmp_path / "dialog").exists, "the dialog")
+        shown = (tmp_path / "dialog").read_text()
+        assert str(project) in shown and "BFTEST_PROJECT" in shown and 'hosts = ["example.org"]' in shown
+
+    def test_trusting_in_the_dialog_turns_the_policy_on(self, egress_env, project):
+        egress_env["FAKE_DIALOG_REPLY"] = "button returned:Trust, gave up:false"
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id = _ask(egress_env, project)
+        _settle(egress_env, project_id)
+
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        token, _, _ = _token_line(egress_env)
+        assert f"http://blindfold:{token}@127.0.0.1:" in wrapped
+        assert "BFTEST_PROJECT={{BFTEST_PROJECT}}" in wrapped
+        assert f"SSL_CERT_FILE={_ca_bundle(egress_env)}" in wrapped
+
+    @pytest.mark.parametrize("reply", ["error: User canceled. (-128)", "button returned:, gave up:true",
+                                       "execution error: no GUI"], ids=["deny", "no-answer", "no-gui"])
+    def test_anything_but_trust_leaves_the_policy_off(self, egress_env, project, reply):
+        egress_env["FAKE_DIALOG_REPLY"] = reply
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id = _ask(egress_env, project)
+        _settle(egress_env, project_id)
+
+        assert not (_private(egress_env) / "trusted" / f"{project_id}.toml").exists()
+        denied = (_private(egress_env) / "denied" / f"{project_id}.toml").exists()
+        assert denied == (reply.endswith("(-128)")), "only a Deny click may record a denial"
+
+    def test_invalid_project_policy_is_refused_with_the_reason(self, egress_env, project, tmp_path):
+        (project / ".blindfold.toml").write_text('[secrets.X]\nhosts = ["*.a.com"]\nheader = "X"\n')
+
+        result, _ = _ask(egress_env, project)
+
+        assert result.returncode == 2
+        assert "wildcards are not allowed" in result.stderr
+        time.sleep(0.3)
+        assert not (tmp_path / "dialog").exists(), "asked to approve a policy that can't load"
+
+    def test_edited_policy_needs_approval_again(self, egress_env, project):
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id = _ask(egress_env, project)
+        _settle(egress_env, project_id)
+        _decide(egress_env, project_id, PROJECT_POLICY, "trusted")
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY.replace("example.org", "evil.example"))
+
+        result = run_guard(build_guard_input("echo hi"), egress_env, cwd=project)
+
+        assert result.returncode == 2
+        assert "waiting for your approval" in result.stderr
+
+    def test_denied_policy_is_ignored(self, egress_env, project):
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id = _ask(egress_env, project)
+        _settle(egress_env, project_id)
+        _decide(egress_env, project_id, PROJECT_POLICY, "denied")
+
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        assert "BFTEST_PROJECT" not in wrapped
+
+    @pytest.mark.parametrize("answer,kept_in", [("y\n", "trusted"), ("n\n", "denied")])
+    def test_answering_in_a_terminal_records_the_decision(self, egress_env, project, answer, kept_in):
+        # Keep the background dialog busy so the terminal answer is the one that counts
+        egress_env["FAKE_DIALOG_DELAY"] = "3"
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id = _ask(egress_env, project)
+
+        out, err = self._answer_in_a_terminal(egress_env, project, answer)
+
+        kept = _private(egress_env) / kept_in / f"{project_id}.toml"
+        assert kept.read_text() == PROJECT_POLICY, f"out={out!r} err={err!r}"
+        if kept_in == "trusted":
+            assert "BFTEST_PROJECT={{BFTEST_PROJECT}}" in wrap_through_guard("echo hi", egress_env, cwd=project)
+
+
 def _egress_sandbox_applies() -> bool:
     # Evaluated at collection time on every platform, so check first
     if shutil.which("sandbox-exec") is None:
         return False
-    r = subprocess.run(["sandbox-exec", "-D", "CONFIG_DIR=/nonexistent", "-D", "INSTALL_DIR=/nonexistent",
+    params = [f"{p}=/nonexistent" for p in ("CONFIG_DIR", "INSTALL_DIR", "PRIVATE_DIR", "PROJECT_POLICY")]
+    r = subprocess.run(["sandbox-exec", *[w for p in params for w in ("-D", p)],
                         "-f", str(EGRESS_PROFILE), "/usr/bin/true"],
                        capture_output=True, text=True)
     return r.returncode == 0
@@ -267,6 +442,27 @@ class TestEgressRuntime:
             assert fine.exists(), f"ordinary writes broke: stderr={result.stderr!r}"
         finally:
             script.unlink(missing_ok=True)
+
+    def test_commands_cannot_read_project_tokens(self, egress_env, project):
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id = _ask(egress_env, project)
+        _settle(egress_env, project_id)
+        _decide(egress_env, project_id, PROJECT_POLICY, "denied")
+        tokens = _private(egress_env) / "tokens.tsv"
+
+        result = execute_wrapped(wrap_through_guard(f"cat {tokens}", egress_env, cwd=project))
+
+        assert result.returncode != 0 and _token_line(egress_env)[0] not in result.stdout
+
+    def test_commands_cannot_write_the_project_policy(self, egress_env, project):
+        policy, fine = project / ".blindfold.toml", project / "fine.txt"
+        assert not policy.exists()
+        cmd = f"echo x > {policy}; echo x > {fine}"
+
+        result = execute_wrapped(wrap_through_guard(cmd, egress_env, cwd=project))
+
+        assert not policy.exists(), "a sandboxed command wrote the project policy"
+        assert fine.exists(), f"stderr={result.stderr!r}"
 
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     def test_https_goes_through_the_proxy_and_is_logged(self, egress_env):
