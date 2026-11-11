@@ -41,14 +41,19 @@ var (
 )
 
 // The guard exports each secret name as an environment variable holding its
-// placeholder, so a name that shadows one of these would break the sandbox.
+// placeholder, so a name that shadows one of these would break the sandbox or
+// the tools in it. tests/test_egress.py checks this covers every variable the
+// guard sets itself.
 var reservedNames = []string{
 	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "OLDPWD", "IFS",
 	"ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "LANG", "TERM",
 	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
 	"SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-	"GIT_SSL_CAINFO", "PIP_CERT",
+	"GIT_SSL_CAINFO", "PIP_CERT", "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP",
 }
+
+// Prefixes of variables that change how programs load code
+var reservedPrefixes = []string{"DYLD_", "LD_", "BASH_FUNC_"}
 
 // Headers that carry framing or routing; putting a secret in them makes no sense
 var forbiddenHeaders = []string{
@@ -82,7 +87,9 @@ func (p *Policy) validate() error {
 		if !secretName.MatchString(name) {
 			return fmt.Errorf("secrets.%s: names may only use letters, digits and _", name)
 		}
-		if slices.Contains(reservedNames, strings.ToUpper(name)) {
+		upper := strings.ToUpper(name)
+		if slices.Contains(reservedNames, upper) ||
+			slices.ContainsFunc(reservedPrefixes, func(p string) bool { return strings.HasPrefix(upper, p) }) {
 			return fmt.Errorf("secrets.%s: that name is reserved for the sandbox's own environment", name)
 		}
 		if err := r.validate(); err != nil {

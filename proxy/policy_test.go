@@ -80,6 +80,7 @@ func TestRejectsUnsafePolicies(t *testing.T) {
 		"framing header":   `[secrets.A]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "host"`,
 		"odd query name":   `[secrets.A]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `query = "a&b"`,
 		"reserved name":    `[secrets.PATH]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "X"`,
+		"loader variable":  `[secrets.DYLD_INSERT_LIBRARIES]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "X"`,
 		"bad name":         `[secrets."A-B"]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "X"`,
 		"typo in a key":    `[secrets.A]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `hedaer = "X"`,
 		"not toml":         `this is not toml`,
