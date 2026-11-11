@@ -80,7 +80,9 @@ egress_enabled() {
 # Sets PROXY_PORT to a running proxy, starting one first if needed. The proxy
 # exits by itself when its binary is rebuilt, so a dead port means "start it".
 # A proxy without a state file predates policies and is replaced too. The wait
-# is capped at 2s so a slow start fails cleanly inside the hook's 5s timeout.
+# is capped at 3s: long enough for the first launch after a rebuild, which
+# macOS slows down to check the new binary, and short enough to fail cleanly
+# inside the hook's 5s timeout.
 ensure_proxy() {
   local i
   PROXY_PORT=""
@@ -99,7 +101,7 @@ ensure_proxy() {
   [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
   nohup "$PROXY_BIN" "${args[@]}" </dev/null >/dev/null 2>&1 &
   echo "$!" >"$PROXY_PID_FILE"
-  for ((i = 0; i < 100; i++)); do
+  for ((i = 0; i < 150; i++)); do
     if [[ -s "$PROXY_PORT_FILE" ]]; then
       read -r PROXY_PORT <"$PROXY_PORT_FILE"
       return 0
