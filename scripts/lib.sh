@@ -36,12 +36,17 @@ AUDIT_LOG="${BLINDFOLD_AUDIT_LOG:-${EGRESS_LOG%/*}/audit.jsonl}"
 # Blindfold's own switches, as NAME=value lines. It sits in CONFIG_DIR, which
 # the agent can't write under lockdown, so the agent can't turn them off.
 SETTINGS_FILE="${CONFIG_DIR}/settings"
+# Claude Code's user settings. They, a project's .claude/settings*.json and
+# the shell profiles Claude Code starts from switch the hooks and lockdown on,
+# so under lockdown the agent can't change them.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
 _SV_PLATFORM=""
 PROTECTED_DIRS=()
+KEPT_FILES=()
 
 # Returns the keychain path arg for security commands, or empty if using login keychain.
 _keychain_arg() {
@@ -334,6 +339,47 @@ is_protected_path() {
   [[ "${1##*/}" == "$PROJECT_POLICY_FILE" ]] && return 0
   path_is_inside "$1" "${PROTECTED_DIRS[@]}" && return 0
   [[ "${RESOLVED_PATH##*/}" == "$PROJECT_POLICY_FILE" ]]
+}
+
+# Adds to KEPT_FILES the real path of each name in folder $1, and for a
+# symlink, the real path of what it points to as well
+add_kept() {
+  local dir="$1" name
+  shift
+  [[ -L "$dir" ]] && KEPT_FILES+=("$dir")
+  resolve_path "$dir" || return 0
+  dir="$RESOLVED_PATH"
+  for name in "$@"; do
+    KEPT_FILES+=("${dir}/${name}")
+    [[ -L "${dir}/${name}" ]] && resolve_path "${dir}/${name}" && KEPT_FILES+=("$RESOLVED_PATH")
+  done
+}
+
+# Sets KEPT_FILES to Claude Code's user settings, its plugins folder (which
+# says what's installed and where it came from) and the shell profiles, once
+# per run
+kept_files() {
+  [[ ${#KEPT_FILES[@]} -gt 0 ]] && return 0
+  local zsh=(.zshenv .zprofile .zshrc .zlogin)
+  add_kept "$CLAUDE_DIR" settings.json settings.local.json plugins
+  add_kept "$HOME" "${zsh[@]}" .bash_profile .bash_login .bashrc .profile
+  add_kept "$HOME/.config/fish" config.fish
+  [[ -n "${ZDOTDIR:-}" ]] && add_kept "$ZDOTDIR" "${zsh[@]}"
+}
+
+# True for a file named like a project's Claude Code settings, anywhere
+is_project_settings() {
+  [[ "$1" == */.claude/settings.json || "$1" == */.claude/settings.local.json ]]
+}
+
+# True for Claude Code's settings, its plugins folder and the shell profiles.
+# The guard only refuses these under lockdown: without it, Bash can write them
+# anyway.
+is_claude_settings_path() {
+  is_project_settings "$1" && return 0
+  kept_files
+  path_is_inside "$1" "${KEPT_FILES[@]}" && return 0
+  is_project_settings "$RESOLVED_PATH"
 }
 
 # True for the private folder, where reading a project token would let the
