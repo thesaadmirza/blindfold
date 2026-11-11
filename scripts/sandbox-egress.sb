@@ -1,0 +1,7 @@
+(version 1)
+(allow default)
+(deny mach-lookup (global-name "com.apple.SecurityServer"))
+; Outbound traffic may only reach loopback, where the Blindfold proxy and any
+; local dev servers listen. Everything else has to go through the proxy.
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))

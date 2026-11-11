@@ -8,11 +8,19 @@ ACCOUNT_PREFIX="claude-secret"
 MIN_REDACT_LENGTH=4
 # Default to login keychain. Set BLINDFOLD_KEYCHAIN to use a dedicated keychain.
 BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-}"
+# Set BLINDFOLD_EGRESS=proxy to let sandboxed commands reach the network only
+# through the local proxy (macOS only, experimental).
+BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
+
+# Callers that already know this directory can set _SV_LIB_DIR first and skip the lookup
+_SV_LIB_DIR="${_SV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PROXY_BIN="${BLINDFOLD_PROXY_BIN:-${_SV_LIB_DIR}/../bin/blindfold-proxy}"
+PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-$HOME/.config/blindfold/run/proxy.port}"
+EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
-_SV_SANDBOX_PROFILE=""
 _SV_PLATFORM=""
 
 # Returns the keychain path arg for security commands, or empty if using login keychain.
@@ -49,25 +57,62 @@ has_sandbox() {
   esac
 }
 
-get_sandbox_profile() {
-  if [[ -n "$_SV_SANDBOX_PROFILE" ]]; then
-    echo "$_SV_SANDBOX_PROFILE"
-    return
-  fi
-  local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  _SV_SANDBOX_PROFILE="${script_dir}/sandbox.sb"
-  echo "$_SV_SANDBOX_PROFILE"
+egress_enabled() {
+  [[ "$BLINDFOLD_EGRESS" == "proxy" && "$OSTYPE" == darwin* ]]
 }
 
-run_sandboxed() {
-  local profile
-  profile=$(get_sandbox_profile)
-  if [[ "$(get_platform)" == "Darwin" && -f "$profile" ]] && command -v sandbox-exec &>/dev/null; then
-    sandbox-exec -f "$profile" "$@"
-  else
-    "$@"
+# Sets PROXY_PORT to a running proxy, starting one first if needed. The wait is
+# capped at 2s so a slow start fails cleanly inside the hook's 5s timeout.
+ensure_proxy() {
+  local i
+  PROXY_PORT=""
+  read -r PROXY_PORT <"$PROXY_PORT_FILE" 2>/dev/null
+  if [[ -n "$PROXY_PORT" ]] && { true <>"/dev/tcp/127.0.0.1/${PROXY_PORT}"; } 2>/dev/null; then
+    return 0
   fi
+  [[ -x "$PROXY_BIN" ]] || return 1
+
+  mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
+  rm -f "$PROXY_PORT_FILE"
+  nohup "$PROXY_BIN" --port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" </dev/null >/dev/null 2>&1 &
+  echo "$!" > "${PROXY_PORT_FILE%.port}.pid"
+  for ((i = 0; i < 100; i++)); do
+    if [[ -s "$PROXY_PORT_FILE" ]]; then
+      read -r PROXY_PORT <"$PROXY_PORT_FILE"
+      return 0
+    fi
+    sleep 0.02
+  done
+  return 1
+}
+
+# Sets SANDBOX_ARGV to the words that run a command sandboxed, or to nothing
+# where there is no sandbox. The guard and run_sandboxed both use it, so the
+# choice of profile and proxy lives in one place. Fails when egress lockdown is
+# on but can't be set up, so callers refuse rather than run unprotected.
+build_sandbox_argv() {
+  SANDBOX_ARGV=()
+  [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
+
+  if egress_enabled; then
+    local profile="${_SV_LIB_DIR}/sandbox-egress.sb"
+    [[ -f "$profile" ]] && ensure_proxy || return 1
+    local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
+    SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
+      "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts"
+      sandbox-exec -f "$profile")
+  elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
+    SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
+  fi
+}
+
+EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
+EGRESS_SETUP_HINT="Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
+
+run_sandboxed() {
+  build_sandbox_argv || { echo "ERROR: ${EGRESS_SETUP_ERROR} ${EGRESS_SETUP_HINT}" >&2; return 1; }
+  # The +-form keeps an empty array from tripping set -u on bash 3.2
+  ${SANDBOX_ARGV[@]+"${SANDBOX_ARGV[@]}"} "$@"
 }
 
 check_dependencies() {

@@ -65,6 +65,22 @@ The same hook also covers the Read tool. If a file contains the value of any sto
 
 On Linux, the guard hook falls back to string matching since Seatbelt is macOS only.
 
+## Egress lockdown (experimental, macOS)
+
+By default a sandboxed command can still connect anywhere. Egress lockdown changes that. Sandboxed commands can only reach loopback, so the rest of their traffic has to go through a small local proxy, which logs every destination to `~/.local/state/blindfold/egress.jsonl`.
+
+This first version only tunnels. It doesn't inject secrets or block hosts yet, so it doesn't stop a secret from leaving through `secret-exec.sh`. It's for finding out what your tools need before the stricter parts of [the design](docs/design/destination-binding.md) land. DNS is blocked inside the sandbox, and tools that ignore `HTTPS_PROXY` will fail to connect.
+
+To try it, build the proxy (needs Go 1.24+):
+
+```bash
+bash ~/.claude/skills/blindfold/scripts/build-proxy.sh
+```
+
+Then set `BLINDFOLD_EGRESS=proxy` for Claude Code, for example in the `env` block of `~/.claude/settings.json`. The guard starts the proxy on first use. If the proxy can't start, commands are refused rather than run without the lockdown.
+
+macOS won't apply this profile inside another sandbox. If Claude Code's own sandbox is on, commands under egress lockdown fail to start.
+
 ## Files
 
 ```
@@ -77,9 +93,12 @@ blindfold/
 │       └── SKILL.md
 ├── hooks/
 │   └── hooks.json
+├── proxy/              # egress proxy (Go)
 ├── scripts/
+│   ├── build-proxy.sh
 │   ├── lib.sh
 │   ├── sandbox.sb
+│   ├── sandbox-egress.sb
 │   ├── secret-store.sh
 │   ├── secret-list.sh
 │   ├── secret-delete.sh
