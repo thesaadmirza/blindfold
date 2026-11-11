@@ -15,12 +15,12 @@ func setupProject(t *testing.T, current, approved string) (private, project stri
 	t.Helper()
 	private, project = t.TempDir(), t.TempDir()
 	os.MkdirAll(filepath.Join(private, "trusted"), 0o700)
-	os.WriteFile(tokensFile(private), []byte("tok1\t"+project+"\n"), 0o600)
+	os.WriteFile(tokensFile(private), []byte("tok1\tid1\t"+project+"\n"), 0o600)
 	if current != "" {
 		os.WriteFile(filepath.Join(project, ProjectPolicyFile), []byte(current), 0o600)
 	}
 	if approved != "" {
-		os.WriteFile(trustedFile(private, "tok1"), []byte(approved), 0o600)
+		os.WriteFile(trustedFile(private, "id1"), []byte(approved), 0o600)
 	}
 	return private, project
 }
@@ -55,7 +55,7 @@ func TestProjectsThatAreNotApprovedAreIgnored(t *testing.T) {
 
 func TestProjectsStampIsStableAndSeesEdits(t *testing.T) {
 	private, project := setupProject(t, projectPolicy, projectPolicy)
-	os.WriteFile(tokensFile(private), []byte("tok1\t"+project+"\ntok2\t"+t.TempDir()+"\ntok3\t/x\n"), 0o600)
+	os.WriteFile(tokensFile(private), []byte("tok1\tid1\t"+project+"\ntok2\tid2\t"+t.TempDir()+"\ntok3\tid3\t/x\n"), 0o600)
 	first := projectsStamp(private)
 
 	for i := 0; i < 20; i++ {

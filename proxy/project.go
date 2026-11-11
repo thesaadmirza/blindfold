@@ -25,19 +25,23 @@ type Project struct {
 
 // The private dir holds what the sandbox must neither read nor write:
 //
-//	tokens.tsv            one "token<TAB>project path" line per project
-//	trusted/<token>.toml  the exact copy of a .blindfold.toml the user approved
+//	tokens.tsv         one "token<TAB>id<TAB>project path" line per project
+//	trusted/<id>.toml  the exact copy of a .blindfold.toml the user approved
 //
-// The guard creates tokens and the approval dialog writes trusted copies.
+// The token is secret: it's what a request shows to be from that project. The
+// id only names files, so listing the folder gives no token away. The guard
+// creates both, and the approval dialog writes trusted copies.
 func tokensFile(private string) string { return filepath.Join(private, "tokens.tsv") }
 
-func trustedFile(private, token string) string {
-	return filepath.Join(private, "trusted", token+".toml")
+func trustedFile(private, id string) string {
+	return filepath.Join(private, "trusted", id+".toml")
 }
 
-// readTokens maps each token to its project path
-func readTokens(private string) map[string]string {
-	tokens := map[string]string{}
+type tokenEntry struct{ id, path string }
+
+// readTokens maps each token to its project's id and path
+func readTokens(private string) map[string]tokenEntry {
+	tokens := map[string]tokenEntry{}
 	f, err := os.Open(tokensFile(private))
 	if err != nil {
 		return tokens
@@ -45,9 +49,9 @@ func readTokens(private string) map[string]string {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		token, path, ok := strings.Cut(sc.Text(), "\t")
-		if ok && token != "" && filepath.IsAbs(path) {
-			tokens[token] = path
+		fields := strings.SplitN(sc.Text(), "\t", 3)
+		if len(fields) == 3 && fields[0] != "" && fields[1] != "" && filepath.IsAbs(fields[2]) {
+			tokens[fields[0]] = tokenEntry{id: fields[1], path: fields[2]}
 		}
 	}
 	return tokens
@@ -61,21 +65,21 @@ func loadProjects(private string) map[string]*Project {
 	if private == "" {
 		return projects
 	}
-	for token, path := range readTokens(private) {
-		approved, err := os.ReadFile(trustedFile(private, token))
+	for token, e := range readTokens(private) {
+		approved, err := os.ReadFile(trustedFile(private, e.id))
 		if err != nil {
 			continue
 		}
-		current, err := os.ReadFile(filepath.Join(path, ProjectPolicyFile))
+		current, err := os.ReadFile(filepath.Join(e.path, ProjectPolicyFile))
 		if err != nil || !bytes.Equal(current, approved) {
 			continue
 		}
 		pol, err := ParsePolicy(approved)
 		if err != nil {
-			log.Printf("%s: %v", filepath.Join(path, ProjectPolicyFile), err)
+			log.Printf("%s: %v", filepath.Join(e.path, ProjectPolicyFile), err)
 			continue
 		}
-		projects[token] = &Project{Path: path, Policy: pol}
+		projects[token] = &Project{Path: e.path, Policy: pol}
 	}
 	return projects
 }
@@ -89,8 +93,8 @@ func projectsStamp(private string) string {
 	tokens := readTokens(private)
 	fmt.Fprint(&b, stamp(tokensFile(private)))
 	for _, token := range slices.Sorted(maps.Keys(tokens)) {
-		path := filepath.Join(tokens[token], ProjectPolicyFile)
-		fmt.Fprint(&b, "|", token, stamp(trustedFile(private, token)), stamp(path))
+		e := tokens[token]
+		fmt.Fprint(&b, "|", e.id, stamp(trustedFile(private, e.id)), stamp(filepath.Join(e.path, ProjectPolicyFile)))
 	}
 	return b.String()
 }
