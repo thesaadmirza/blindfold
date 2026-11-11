@@ -76,7 +76,12 @@ func TestIdenticalRequestsShareOneDialog(t *testing.T) {
 		wg.Add(1)
 		go func() { defer wg.Done(); results[i], _ = a.approve(postIssue) }()
 	}
-	time.Sleep(50 * time.Millisecond)
+	// Answer only once the other four are waiting on this dialog
+	for deadline := time.Now().Add(5 * time.Second); a.waitersFor(postIssue) < 4; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d requests waited on the dialog", a.waitersFor(postIssue))
+		}
+	}
 	close(release)
 	wg.Wait()
 

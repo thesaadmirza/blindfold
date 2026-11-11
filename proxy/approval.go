@@ -49,8 +49,9 @@ type approver struct {
 }
 
 type pendingAnswer struct {
-	done chan struct{}
-	ans  answer
+	done    chan struct{}
+	ans     answer
+	waiters int // requests waiting on this answer besides the one asking
 }
 
 func newApprover(ask func(approvalRequest) answer) *approver {
@@ -68,6 +69,7 @@ func (a *approver) approve(req approvalRequest) (bool, string) {
 			return true, "within a 30-minute approval"
 		}
 		if w := a.waiting[key]; w != nil {
+			w.waiters++
 			a.mu.Unlock()
 			<-w.done
 			if w.ans == deny {
@@ -147,4 +149,14 @@ func shownText(s string) string {
 		s = string(r[:120]) + "..."
 	}
 	return s
+}
+
+// waitersFor reports how many requests are waiting on a dialog for req
+func (a *approver) waitersFor(req approvalRequest) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if w := a.waiting[req.key()]; w != nil {
+		return w.waiters
+	}
+	return 0
 }
