@@ -71,17 +71,14 @@ func (st *policyState) rulesFor(token, host string) (map[string]*Rule, map[strin
 	return rules, scopes
 }
 
-// knows reports whether any loaded policy names the secret
-func (st *policyState) knows(name string) bool {
-	if st.policy.Secrets[name] != nil {
-		return true
-	}
+// names returns every secret any loaded policy names
+func (st *policyState) names() []string {
+	names := st.policy.Names()
 	for _, proj := range st.projects {
-		if proj.Policy.Secrets[name] != nil {
-			return true
-		}
+		names = append(names, proj.Policy.Names()...)
 	}
-	return false
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // NewProxy returns a proxy with an empty policy. lookup returns the stored
@@ -204,10 +201,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	// Plain HTTP is never filled in, but a placeholder sent this way is worth
 	// a line in the audit log
 	if st := p.state.Load(); st != nil {
-		for _, name := range placeholdersIn(r) {
-			if st.knows(name) {
-				p.auditLog(AuditEntry{Decision: auditPlainHTTP, Secret: name, Method: r.Method, Host: r.URL.Hostname(), Path: r.URL.Path})
-			}
+		for _, name := range placeholdersIn(r, st.names()) {
+			p.auditLog(AuditEntry{Decision: auditPlainHTTP, Secret: name, Method: r.Method, Host: r.URL.Hostname(), Path: r.URL.Path})
 		}
 	}
 	start := time.Now()

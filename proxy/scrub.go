@@ -13,40 +13,48 @@ const minScrubLength = 4
 
 // scrubPair is one secret: its value, and the placeholder that replaces it
 type scrubPair struct {
-	name, value, placeholder string
+	name        string
+	value       []byte
+	placeholder []byte
+}
+
+func newScrubPair(name, value string) scrubPair {
+	return scrubPair{name, []byte(value), []byte(placeholder(name))}
+}
+
+// sortScrubPairs puts longer values first, so where one value contains
+// another the longer match wins, in headers and bodies alike
+func sortScrubPairs(pairs []scrubPair) {
+	slices.SortFunc(pairs, func(a, b scrubPair) int { return len(b.value) - len(a.value) })
 }
 
 // scrubber reads a body and replaces every copy of a secret's value with its
 // placeholder, so an API that echoes a token back can't hand it to the agent.
-// It holds back the last few bytes of each read, in case a value is split
-// across two reads, and counts what it replaced for the audit log.
+// When a read ends partway into something that could be a value, it holds
+// those bytes back until the next read settles it. Counts of what it
+// replaced go into found, for the audit log.
 type scrubber struct {
-	src    io.ReadCloser
-	pairs  []scrubPair // longest value first, so a longer match wins
-	keep   int         // bytes to hold back: longest value minus one
-	raw    []byte      // read but not yet scanned
-	out    []byte      // scanned and ready to hand out
-	eof    bool
-	found  map[string]int
-	onDone func(found map[string]int)
-	done   bool
+	src   io.ReadCloser
+	pairs []scrubPair // sorted by sortScrubPairs
+	raw   []byte      // read but not yet scanned
+	out   []byte      // scanned and ready to hand out
+	eof   bool
+	found map[string]int
 }
 
-func newScrubber(src io.ReadCloser, pairs []scrubPair, onDone func(map[string]int)) *scrubber {
-	pairs = slices.Clone(pairs)
-	slices.SortFunc(pairs, func(a, b scrubPair) int { return len(b.value) - len(a.value) })
-	return &scrubber{src: src, pairs: pairs, keep: len(pairs[0].value) - 1, found: map[string]int{}, onDone: onDone}
+func newScrubber(src io.ReadCloser, pairs []scrubPair, found map[string]int) *scrubber {
+	return &scrubber{src: src, pairs: pairs, found: found}
 }
 
 func (s *scrubber) Read(p []byte) (int, error) {
 	for len(s.out) == 0 {
 		if s.eof {
-			s.finish()
 			return 0, io.EOF
 		}
-		chunk := make([]byte, 32*1024)
-		n, err := s.src.Read(chunk)
-		s.raw = append(s.raw, chunk[:n]...)
+		// Read straight into spare room at the end of raw
+		s.raw = slices.Grow(s.raw, 32<<10)
+		n, err := s.src.Read(s.raw[len(s.raw):cap(s.raw)])
+		s.raw = s.raw[:len(s.raw)+n]
 		switch {
 		case err == io.EOF:
 			s.eof = true
@@ -60,8 +68,8 @@ func (s *scrubber) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// scan moves everything that can no longer be the start of a value from raw
-// to out, replacing values on the way
+// scan moves everything that can no longer be part of a value from raw to
+// out, replacing values on the way
 func (s *scrubber) scan() {
 	for {
 		at, pair := s.earliest()
@@ -72,47 +80,46 @@ func (s *scrubber) scan() {
 		s.raw = s.raw[at+len(pair.value):]
 		s.found[pair.name]++
 	}
-	// A value can only start in the last keep bytes and still be incomplete
-	cut := len(s.raw) - s.keep
-	if s.eof {
-		cut = len(s.raw)
+	cut := len(s.raw)
+	if !s.eof {
+		cut -= s.pendingPrefix()
 	}
-	if cut > 0 {
-		s.out = append(s.out, s.raw[:cut]...)
-		s.raw = s.raw[cut:]
+	s.out = append(s.out, s.raw[:cut]...)
+	s.raw = s.raw[cut:]
+}
+
+// pendingPrefix is how many bytes at the end of raw could be the start of a
+// value, which is usually none
+func (s *scrubber) pendingPrefix() int {
+	for k := min(len(s.raw), len(s.pairs[0].value)-1); k > 0; k-- {
+		tail := s.raw[len(s.raw)-k:]
+		for _, p := range s.pairs {
+			if bytes.HasPrefix(p.value, tail) {
+				return k
+			}
+		}
 	}
+	return 0
 }
 
 // earliest finds the first value in raw, the longest one if two start together
 func (s *scrubber) earliest() (int, scrubPair) {
 	at, best := -1, scrubPair{}
 	for _, p := range s.pairs {
-		if i := bytes.Index(s.raw, []byte(p.value)); i >= 0 && (at < 0 || i < at) {
+		if i := bytes.Index(s.raw, p.value); i >= 0 && (at < 0 || i < at) {
 			at, best = i, p
 		}
 	}
 	return at, best
 }
 
-func (s *scrubber) finish() {
-	if !s.done {
-		s.done = true
-		if s.onDone != nil {
-			s.onDone(s.found)
-		}
-	}
-}
-
-func (s *scrubber) Close() error {
-	s.finish()
-	return s.src.Close()
-}
+func (s *scrubber) Close() error { return s.src.Close() }
 
 // scrubString replaces values in a header value, counting what it replaced
 func scrubString(v string, pairs []scrubPair, found map[string]int) string {
 	for _, p := range pairs {
-		if n := strings.Count(v, p.value); n > 0 {
-			v = strings.ReplaceAll(v, p.value, p.placeholder)
+		if n := strings.Count(v, string(p.value)); n > 0 {
+			v = strings.ReplaceAll(v, string(p.value), string(p.placeholder))
 			found[p.name] += n
 		}
 	}

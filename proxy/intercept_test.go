@@ -202,18 +202,21 @@ func (h *harness) clientFor(token string) *http.Client {
 
 func (h *harness) do(req *http.Request) *http.Response {
 	h.t.Helper()
-	return h.send(h.client, req)
+	resp, _ := h.send(h.client, req)
+	return resp
 }
 
-func (h *harness) send(c *http.Client, req *http.Request) *http.Response {
+// send makes the request with client c and returns the response, with its
+// body already read into the string
+func (h *harness) send(c *http.Client, req *http.Request) (*http.Response, string) {
 	h.t.Helper()
 	resp, err := c.Do(req)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	return resp
+	return resp, string(body)
 }
 
 func newRequest(t *testing.T, method, rawURL, body string) *http.Request {
@@ -392,6 +395,9 @@ func TestMissingValueFailsTheRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusBadGateway || len(h.allowed.requests()) != 0 {
 		t.Fatalf("status = %d, forwarded = %d", resp.StatusCode, len(h.allowed.requests()))
 	}
+	if got := h.audited(auditMissing); len(got) != 1 || got[0].Secret != "UNSTORED" {
+		t.Fatalf("refused-missing = %+v", got)
+	}
 }
 
 func TestRequestWithoutPlaceholdersIsForwardedUnchanged(t *testing.T) {
@@ -540,18 +546,6 @@ func (h *harness) audited(decision string) []AuditEntry {
 	return out
 }
 
-// get sends a request and returns the status and body the client saw
-func (h *harness) get(req *http.Request) (int, http.Header, string) {
-	h.t.Helper()
-	resp, err := h.client.Do(req)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode, resp.Header, string(body)
-}
-
 func TestEchoedValueIsScrubbed(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("Private-Token")
@@ -561,10 +555,10 @@ func TestEchoedValueIsScrubbed(t *testing.T) {
 	req := newRequest(t, "GET", "https://"+allowedHost+"/echo?x=1", "")
 	req.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
 
-	_, header, body := h.get(req)
+	resp, body := h.send(h.client, req)
 
-	if body != `{"you_sent":"{{GITLAB_TOKEN}}"}` || header.Get("X-Echo") != "{{GITLAB_TOKEN}}" {
-		t.Fatalf("value came back: header %q body %q", header.Get("X-Echo"), body)
+	if body != `{"you_sent":"{{GITLAB_TOKEN}}"}` || resp.Header.Get("X-Echo") != "{{GITLAB_TOKEN}}" {
+		t.Fatalf("value came back: header %q body %q", resp.Header.Get("X-Echo"), body)
 	}
 	if got := h.audited(auditFilled); len(got) != 1 || got[0].Secret != "GITLAB_TOKEN" || got[0].Path != "/echo" || got[0].Status != 200 {
 		t.Fatalf("filled = %+v", got)
@@ -580,7 +574,7 @@ func TestStoredValueReturnedLaterIsScrubbed(t *testing.T) {
 		io.WriteString(w, "webhook secret: "+tokenValue)
 	})
 
-	_, _, body := h.get(newRequest(t, "GET", "https://"+allowedHost+"/hooks/1", ""))
+	_, body := h.send(h.client, newRequest(t, "GET", "https://"+allowedHost+"/hooks/1", ""))
 
 	if strings.Contains(body, tokenValue) || !strings.Contains(body, "{{GITLAB_TOKEN}}") {
 		t.Fatalf("body = %q", body)
@@ -601,7 +595,7 @@ func TestGzippedResponseIsScrubbed(t *testing.T) {
 	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
 	req.Header.Set("Accept-Encoding", "gzip, br")
 
-	_, _, body := h.get(req)
+	_, body := h.send(h.client, req)
 
 	if body != "compressed: {{GITLAB_TOKEN}}" {
 		t.Fatalf("body = %q", body)
@@ -614,10 +608,10 @@ func TestResponseThatCannotBeCheckedIsRefused(t *testing.T) {
 		io.WriteString(w, "pretend brotli: "+tokenValue)
 	})
 
-	status, _, body := h.get(newRequest(t, "GET", "https://"+allowedHost+"/", ""))
+	resp, body := h.send(h.client, newRequest(t, "GET", "https://"+allowedHost+"/", ""))
 
-	if status != http.StatusBadGateway || strings.Contains(body, tokenValue) {
-		t.Fatalf("status %d body %q", status, body)
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(body, tokenValue) {
+		t.Fatalf("status %d body %q", resp.StatusCode, body)
 	}
 	if got := h.audited(auditEncoding); len(got) != 1 || got[0].Detail != "br" {
 		t.Fatalf("audit = %+v", got)
@@ -650,19 +644,5 @@ func TestRefusalsAreAudited(t *testing.T) {
 	}
 	if got := h.audited(auditPlainHTTP); len(got) != 1 || got[0].Secret != "MAPS_KEY" || got[0].Path != "/api" {
 		t.Errorf("plain-http = %+v", got)
-	}
-}
-
-func TestMissingValueIsAudited(t *testing.T) {
-	h := newHarness(t, nil)
-	pol := &Policy{Secrets: map[string]*Rule{"UNSTORED": {Hosts: []string{allowedHost}, Header: "X-Key"}}}
-	h.proxy.SetPolicies(pol, nil)
-	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
-	req.Header.Set("X-Key", "{{UNSTORED}}")
-
-	h.do(req)
-
-	if got := h.audited(auditMissing); len(got) != 1 || got[0].Secret != "UNSTORED" {
-		t.Fatalf("refused-missing = %+v", got)
 	}
 }

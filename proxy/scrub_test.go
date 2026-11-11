@@ -4,34 +4,17 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"testing/iotest"
+	"time"
 )
 
-var scrubPairs = []scrubPair{
-	{"TOKEN", "glpat-secret-value", "{{TOKEN}}"},
-	{"SHORT", "pass1234", "{{SHORT}}"},
-}
+var scrubPairs = func() []scrubPair {
+	pairs := []scrubPair{newScrubPair("SHORT", "pass1234"), newScrubPair("TOKEN", "glpat-secret-value")}
+	sortScrubPairs(pairs)
+	return pairs
+}()
 
-func scrubAll(t *testing.T, body string, chunk int) (string, map[string]int) {
-	t.Helper()
-	var src io.Reader = strings.NewReader(body)
-	if chunk > 0 {
-		// Hand the body over a few bytes at a time, to split values across reads
-		src = iotest.OneByteReader(src)
-		if chunk > 1 {
-			src = &chunkReader{r: strings.NewReader(body), n: chunk}
-		}
-	}
-	var found map[string]int
-	s := newScrubber(io.NopCloser(src), scrubPairs, func(f map[string]int) { found = f })
-	out, err := io.ReadAll(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	return string(out), found
-}
-
+// chunkReader hands a body over at most n bytes at a time, to split values
+// across reads
 type chunkReader struct {
 	r io.Reader
 	n int
@@ -42,6 +25,20 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 		p = p[:c.n]
 	}
 	return c.r.Read(p)
+}
+
+func scrubAll(t *testing.T, body string, chunk int) (string, map[string]int) {
+	t.Helper()
+	var src io.Reader = strings.NewReader(body)
+	if chunk > 0 {
+		src = &chunkReader{r: src, n: chunk}
+	}
+	found := map[string]int{}
+	out, err := io.ReadAll(newScrubber(io.NopCloser(src), scrubPairs, found))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out), found
 }
 
 func TestScrubberReplacesEveryCopy(t *testing.T) {
@@ -75,6 +72,31 @@ func TestScrubberHandlesValueAtTheVeryEnd(t *testing.T) {
 		if got, _ := scrubAll(t, "end:glpat-secret-value", chunk); got != "end:{{TOKEN}}" {
 			t.Fatalf("chunk %d: got %q", chunk, got)
 		}
+	}
+}
+
+// A stream must not stall: a read that can't be the start of a value is
+// handed on whole, without waiting for the next one
+func TestScrubberHoldsBackOnlyWhatCouldBeAValue(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	s := newScrubber(pr, scrubPairs, map[string]int{})
+	go pw.Write([]byte("data: event one\n\n"))
+
+	got := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, _ := s.Read(buf)
+		got <- string(buf[:n])
+	}()
+
+	select {
+	case out := <-got:
+		if out != "data: event one\n\n" {
+			t.Fatalf("got %q", out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the event was held back waiting for more of the stream")
 	}
 }
 

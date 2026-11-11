@@ -2,7 +2,6 @@ package main
 
 import (
 	"net/http"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -40,22 +39,27 @@ func (p *Proxy) auditLog(e AuditEntry) {
 	p.audit(e)
 }
 
-var placeholderPattern = regexp.MustCompile(`\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}`)
-
-// placeholdersIn returns the secret names whose placeholders appear in the
-// request's headers or URL. The body isn't read.
-func placeholdersIn(r *http.Request) []string {
-	var names []string
-	add := func(s string) {
-		for _, m := range placeholderPattern.FindAllStringSubmatch(s, -1) {
-			names = append(names, m[1])
+// placeholdersIn returns which of names have a placeholder in the request's
+// headers or URL. The body isn't read.
+func placeholdersIn(r *http.Request, names []string) []string {
+	var found []string
+	for _, name := range names {
+		ph := placeholder(name)
+		if strings.Contains(r.URL.RawQuery, ph) || strings.Contains(r.URL.Path, ph) || headerContains(r.Header, ph) {
+			found = append(found, name)
 		}
 	}
-	add(r.URL.RawQuery)
-	add(r.URL.Path)
-	for _, vals := range r.Header {
-		add(strings.Join(vals, "\n"))
+	slices.Sort(found)
+	return found
+}
+
+func headerContains(h http.Header, s string) bool {
+	for _, vals := range h {
+		for _, v := range vals {
+			if strings.Contains(v, s) {
+				return true
+			}
+		}
 	}
-	slices.Sort(names)
-	return slices.Compact(names)
+	return false
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -43,25 +42,8 @@ func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, r
 		NextProtos: []string{"http/1.1"},
 		MinVersion: tls.VersionTLS12,
 	})
-	forwarder := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL.Scheme = "https"
-			pr.Out.URL.Host = host
-			pr.Out.Host = host
-			// Responses have to come back readable to be scrubbed. With the
-			// client's header gone, the transport asks for gzip itself and
-			// decodes it before ModifyResponse sees the body.
-			pr.Out.Header.Del("Accept-Encoding")
-		},
-		ModifyResponse: p.scrubResponse,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			http.Error(w, "Blindfold: "+err.Error(), http.StatusBadGateway)
-		},
-		Transport: p.transport,
-		ErrorLog:  log.New(io.Discard, "", 0),
-	}
 	srv := &http.Server{
-		Handler:           p.checkAndInject(host, rules, scopes, forwarder),
+		Handler:           p.checkAndInject(host, rules, scopes),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          log.New(io.Discard, "", 0),
@@ -71,7 +53,7 @@ func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, r
 	srv.Serve(&oneConnListener{conn: tlsConn})
 }
 
-func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[string]string, forwarder http.Handler) http.Handler {
+func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[string]string) http.Handler {
 	lookup := func(name string) (string, error) { return p.lookup(scopes[name], name) }
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e := Entry{Kind: "https", Host: host, Method: r.Method}
@@ -90,42 +72,63 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 			http.Error(w, "Blindfold: request host does not match the tunnel", e.Status)
 			return
 		}
-		used, err := inject(r, rules, lookup)
+		used, ref := inject(r, rules, lookup)
 		e.Secrets = used
-		if err != nil {
-			e.Status, e.Error = http.StatusBadGateway, err.Error()
-			if ref, ok := err.(*refusal); ok {
-				audit(ref.decision, ref.secret, e.Status, "")
-			}
-			http.Error(w, "Blindfold: "+err.Error(), e.Status)
+		if ref != nil {
+			e.Status, e.Error = http.StatusBadGateway, ref.msg
+			audit(ref.decision, ref.secret, e.Status, "")
+			http.Error(w, "Blindfold: "+ref.msg, e.Status)
 			return
 		}
 		// Placeholders left over were somewhere their rule doesn't name
-		for _, name := range placeholdersIn(r) {
-			if rules[name] != nil {
-				audit(auditOutsideSlot, name, 0, "")
-			}
+		for _, name := range placeholdersIn(r, slices.Collect(maps.Keys(rules))) {
+			audit(auditOutsideSlot, name, 0, "")
 		}
 
 		// Every secret this host may receive is scrubbed from what comes back,
 		// filled in on this request or not: an API can store a token and
 		// return it on a later call
 		pairs := scrubPairsFor(rules, lookup)
-		ctx := context.WithValue(r.Context(), scrubKey{}, scrubContext{pairs: pairs, audit: audit})
+		found := map[string]int{}
+		var unreadable string
+		forwarder := &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.Out.URL.Scheme = "https"
+				pr.Out.URL.Host = host
+				pr.Out.Host = host
+				// Responses have to come back readable to be scrubbed. With the
+				// client's header gone, the transport asks for gzip itself and
+				// decodes it before ModifyResponse sees the body.
+				pr.Out.Header.Del("Accept-Encoding")
+			},
+			ModifyResponse: func(resp *http.Response) error {
+				unreadable = scrubResponse(resp, pairs, found)
+				if unreadable != "" {
+					return fmt.Errorf("the response is %s-encoded, which Blindfold can't check for secrets", unreadable)
+				}
+				return nil
+			},
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				http.Error(w, "Blindfold: "+err.Error(), http.StatusBadGateway)
+			},
+			Transport: p.transport,
+			ErrorLog:  log.New(io.Discard, "", 0),
+		}
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		forwarder.ServeHTTP(rec, r.WithContext(ctx))
+		// ServeHTTP returns after the body is copied, so found is complete
+		forwarder.ServeHTTP(rec, r)
 		e.Status = rec.status
+
 		for _, name := range used {
 			audit(auditFilled, name, e.Status, "")
 		}
+		if unreadable != "" {
+			audit(auditEncoding, "", e.Status, unreadable)
+		}
+		for _, name := range slices.Sorted(maps.Keys(found)) {
+			audit(auditEchoed, name, e.Status, fmt.Sprintf("%d copies", found[name]))
+		}
 	})
-}
-
-type scrubKey struct{}
-
-type scrubContext struct {
-	pairs []scrubPair
-	audit func(decision, name string, status int, detail string)
 }
 
 // scrubPairsFor returns the values worth scrubbing for a host's secrets.
@@ -134,41 +137,33 @@ func scrubPairsFor(rules map[string]*Rule, lookup func(string) (string, error)) 
 	var pairs []scrubPair
 	for name := range rules {
 		if v, err := lookup(name); err == nil && len(v) >= minScrubLength {
-			pairs = append(pairs, scrubPair{name, v, placeholder(name)})
+			pairs = append(pairs, newScrubPair(name, v))
 		}
 	}
+	sortScrubPairs(pairs)
 	return pairs
 }
 
 // scrubResponse swaps any copy of a secret's value in the response for its
-// placeholder, in headers now and in the body as it streams
-func (p *Proxy) scrubResponse(resp *http.Response) error {
-	sc, _ := resp.Request.Context().Value(scrubKey{}).(scrubContext)
-	if len(sc.pairs) == 0 {
-		return nil
+// placeholder, in headers now and in the body as it streams, counting copies
+// into found. Returns the encoding when the body is in one it can't read.
+func scrubResponse(resp *http.Response, pairs []scrubPair, found map[string]int) (unreadable string) {
+	if len(pairs) == 0 {
+		return ""
 	}
 	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
-		sc.audit(auditEncoding, "", resp.StatusCode, ce)
-		return fmt.Errorf("the response is %s-encoded, which Blindfold can't check for secrets", ce)
+		return ce
 	}
-	found := map[string]int{}
 	for _, vals := range resp.Header {
 		for i := range vals {
-			vals[i] = scrubString(vals[i], sc.pairs, found)
+			vals[i] = scrubString(vals[i], pairs, found)
 		}
 	}
-	resp.Body = newScrubber(resp.Body, sc.pairs, func(inBody map[string]int) {
-		for name, n := range inBody {
-			found[name] += n
-		}
-		for _, name := range slices.Sorted(maps.Keys(found)) {
-			sc.audit(auditEchoed, name, resp.StatusCode, fmt.Sprintf("%d copies", found[name]))
-		}
-	})
+	resp.Body = newScrubber(resp.Body, pairs, found)
 	// The length changes when a value and its placeholder differ in size
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
-	return nil
+	return ""
 }
 
 // requestHost is the host a request inside a tunnel asks for, taken from an
@@ -189,7 +184,7 @@ func requestHost(r *http.Request) string {
 // slot its rule names. A placeholder anywhere else, such as the body, another
 // header or another parameter, is sent as the literal placeholder. Returns the
 // names it filled in.
-func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string, error)) ([]string, error) {
+func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string, error)) ([]string, *refusal) {
 	var used []string
 	for _, name := range slices.Sorted(maps.Keys(rules)) {
 		rule, ph := rules[name], placeholder(name)
@@ -240,8 +235,6 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 
 // refusal is why inject turned a request away, for the audit log
 type refusal struct{ secret, decision, msg string }
-
-func (e *refusal) Error() string { return e.msg }
 
 // bufferedConn reads through the bufio.Reader the hijack returned, which may
 // already hold the start of the TLS handshake
