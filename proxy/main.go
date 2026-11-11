@@ -10,10 +10,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +119,14 @@ func (w *policyWatcher) watch(every time.Duration) {
 	}
 }
 
+func projectIDs(projects map[string]*Project) map[string]bool {
+	ids := map[string]bool{}
+	for _, p := range projects {
+		ids[p.ID] = true
+	}
+	return ids
+}
+
 // reload applies the policy file and writes what it loaded to the state file,
 // which the guard reads, so the guard and the proxy never disagree about the
 // policy. A policy that doesn't load turns injection off until it's fixed,
@@ -129,7 +139,8 @@ func (w *policyWatcher) reload() error {
 		log.Print(loadErr)
 		pol = &Policy{}
 	}
-	ca, err := w.proxy.SetPolicies(pol, loadProjects(w.private))
+	projects := loadProjects(w.private)
+	ca, err := w.proxy.SetPolicies(pol, projects)
 	if err != nil {
 		return err
 	}
@@ -147,6 +158,11 @@ func (w *policyWatcher) reload() error {
 	}
 	for _, name := range pol.Names() {
 		state += name + "\n"
+	}
+	// "@id" for each approved project in effect, so the guard can wait for a
+	// project it just saw approved
+	for _, id := range slices.Sorted(maps.Keys(projectIDs(projects))) {
+		state += "@" + id + "\n"
 	}
 	return writeFileAtomic(w.state, []byte(state))
 }

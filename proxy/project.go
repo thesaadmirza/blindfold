@@ -19,6 +19,7 @@ const ProjectPolicyFile = ".blindfold.toml"
 
 // Project is a project whose .blindfold.toml the user approved
 type Project struct {
+	ID     string
 	Path   string
 	Policy *Policy
 }
@@ -79,7 +80,7 @@ func loadProjects(private string) map[string]*Project {
 			log.Printf("%s: %v", filepath.Join(e.path, ProjectPolicyFile), err)
 			continue
 		}
-		projects[token] = &Project{Path: e.path, Policy: pol}
+		projects[token] = &Project{ID: e.id, Path: e.path, Policy: pol}
 	}
 	return projects
 }
