@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -537,6 +538,90 @@ func (h *harness) audited(decision string) []AuditEntry {
 		}
 	}
 	return out
+}
+
+// get sends a request and returns the status and body the client saw
+func (h *harness) get(req *http.Request) (int, http.Header, string) {
+	h.t.Helper()
+	resp, err := h.client.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, resp.Header, string(body)
+}
+
+func TestEchoedValueIsScrubbed(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("Private-Token")
+		w.Header().Set("X-Echo", token)
+		io.WriteString(w, `{"you_sent":"`+token+`"}`)
+	})
+	req := newRequest(t, "GET", "https://"+allowedHost+"/echo?x=1", "")
+	req.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
+
+	_, header, body := h.get(req)
+
+	if body != `{"you_sent":"{{GITLAB_TOKEN}}"}` || header.Get("X-Echo") != "{{GITLAB_TOKEN}}" {
+		t.Fatalf("value came back: header %q body %q", header.Get("X-Echo"), body)
+	}
+	if got := h.audited(auditFilled); len(got) != 1 || got[0].Secret != "GITLAB_TOKEN" || got[0].Path != "/echo" || got[0].Status != 200 {
+		t.Fatalf("filled = %+v", got)
+	}
+	if got := h.audited(auditEchoed); len(got) != 1 || got[0].Detail != "2 copies" {
+		t.Fatalf("echoed = %+v", got)
+	}
+}
+
+// An API can keep a token and hand it back on a call that never sent it
+func TestStoredValueReturnedLaterIsScrubbed(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "webhook secret: "+tokenValue)
+	})
+
+	_, _, body := h.get(newRequest(t, "GET", "https://"+allowedHost+"/hooks/1", ""))
+
+	if strings.Contains(body, tokenValue) || !strings.Contains(body, "{{GITLAB_TOKEN}}") {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestGzippedResponseIsScrubbed(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			io.WriteString(w, "not compressed: "+tokenValue)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		io.WriteString(gz, "compressed: "+tokenValue)
+		gz.Close()
+	})
+	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
+	req.Header.Set("Accept-Encoding", "gzip, br")
+
+	_, _, body := h.get(req)
+
+	if body != "compressed: {{GITLAB_TOKEN}}" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestResponseThatCannotBeCheckedIsRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		io.WriteString(w, "pretend brotli: "+tokenValue)
+	})
+
+	status, _, body := h.get(newRequest(t, "GET", "https://"+allowedHost+"/", ""))
+
+	if status != http.StatusBadGateway || strings.Contains(body, tokenValue) {
+		t.Fatalf("status %d body %q", status, body)
+	}
+	if got := h.audited(auditEncoding); len(got) != 1 || got[0].Detail != "br" {
+		t.Fatalf("audit = %+v", got)
+	}
 }
 
 func TestRefusalsAreAudited(t *testing.T) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -47,6 +48,14 @@ func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, r
 			pr.Out.URL.Scheme = "https"
 			pr.Out.URL.Host = host
 			pr.Out.Host = host
+			// Responses have to come back readable to be scrubbed. With the
+			// client's header gone, the transport asks for gzip itself and
+			// decodes it before ModifyResponse sees the body.
+			pr.Out.Header.Del("Accept-Encoding")
+		},
+		ModifyResponse: p.scrubResponse,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, "Blindfold: "+err.Error(), http.StatusBadGateway)
 		},
 		Transport: p.transport,
 		ErrorLog:  log.New(io.Discard, "", 0),
@@ -98,13 +107,68 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 			}
 		}
 
+		// Every secret this host may receive is scrubbed from what comes back,
+		// filled in on this request or not: an API can store a token and
+		// return it on a later call
+		pairs := scrubPairsFor(rules, lookup)
+		ctx := context.WithValue(r.Context(), scrubKey{}, scrubContext{pairs: pairs, audit: audit})
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		forwarder.ServeHTTP(rec, r)
+		forwarder.ServeHTTP(rec, r.WithContext(ctx))
 		e.Status = rec.status
 		for _, name := range used {
 			audit(auditFilled, name, e.Status, "")
 		}
 	})
+}
+
+type scrubKey struct{}
+
+type scrubContext struct {
+	pairs []scrubPair
+	audit func(decision, name string, status int, detail string)
+}
+
+// scrubPairsFor returns the values worth scrubbing for a host's secrets.
+// Values come from the same cache as injection, so this rarely runs `security`.
+func scrubPairsFor(rules map[string]*Rule, lookup func(string) (string, error)) []scrubPair {
+	var pairs []scrubPair
+	for name := range rules {
+		if v, err := lookup(name); err == nil && len(v) >= minScrubLength {
+			pairs = append(pairs, scrubPair{name, v, placeholder(name)})
+		}
+	}
+	return pairs
+}
+
+// scrubResponse swaps any copy of a secret's value in the response for its
+// placeholder, in headers now and in the body as it streams
+func (p *Proxy) scrubResponse(resp *http.Response) error {
+	sc, _ := resp.Request.Context().Value(scrubKey{}).(scrubContext)
+	if len(sc.pairs) == 0 {
+		return nil
+	}
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+		sc.audit(auditEncoding, "", resp.StatusCode, ce)
+		return fmt.Errorf("the response is %s-encoded, which Blindfold can't check for secrets", ce)
+	}
+	found := map[string]int{}
+	for _, vals := range resp.Header {
+		for i := range vals {
+			vals[i] = scrubString(vals[i], sc.pairs, found)
+		}
+	}
+	resp.Body = newScrubber(resp.Body, sc.pairs, func(inBody map[string]int) {
+		for name, n := range inBody {
+			found[name] += n
+		}
+		for _, name := range slices.Sorted(maps.Keys(found)) {
+			sc.audit(auditEchoed, name, resp.StatusCode, fmt.Sprintf("%d copies", found[name]))
+		}
+	})
+	// The length changes when a value and its placeholder differ in size
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	return nil
 }
 
 // requestHost is the host a request inside a tunnel asks for, taken from an
