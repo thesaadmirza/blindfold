@@ -80,6 +80,22 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 			http.Error(w, "Blindfold: "+ref.msg, e.Status)
 			return
 		}
+		// A gated secret waits here, before anything is sent, until a person
+		// allows it
+		approvals := map[string]string{}
+		for _, name := range used {
+			if !rules[name].NeedsApproval(r.Method) {
+				continue
+			}
+			ok, how := p.approver.approve(approvalRequest{name, scopes[name], r.Method, host, r.URL.Path})
+			if !ok {
+				e.Status, e.Error = http.StatusForbidden, how
+				audit(auditApproval, name, e.Status, how)
+				http.Error(w, fmt.Sprintf("Blindfold: using %s for this request was not approved (%s)", name, how), e.Status)
+				return
+			}
+			approvals[name] = how
+		}
 		// Placeholders left over were somewhere their rule doesn't name
 		for _, name := range placeholdersIn(r, slices.Collect(maps.Keys(rules))) {
 			audit(auditOutsideSlot, name, 0, "")
@@ -120,7 +136,7 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 		e.Status = rec.status
 
 		for _, name := range used {
-			audit(auditFilled, name, e.Status, "")
+			audit(auditFilled, name, e.Status, approvals[name])
 		}
 		if unreadable != "" {
 			audit(auditEncoding, "", e.Status, unreadable)

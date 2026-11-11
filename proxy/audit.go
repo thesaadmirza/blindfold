@@ -29,6 +29,7 @@ const (
 	auditWrongHost   = "refused-host"     // request for another host inside a tunnel
 	auditWrongUser   = "refused-username" // basic auth with a username the policy doesn't allow
 	auditMissing     = "refused-missing"  // no stored value to fill in
+	auditApproval    = "refused-approval" // the person said no, or didn't answer
 	auditEncoding    = "refused-encoding" // a response Blindfold couldn't check
 	auditOutsideSlot = "outside-slot"     // placeholder sent somewhere other than its slot
 	auditPlainHTTP   = "plain-http"       // placeholder sent over plain HTTP, never filled
