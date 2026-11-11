@@ -9,6 +9,7 @@ that is itself sandboxed).
 import http.server
 import json
 import os
+import pty
 import re
 import shlex
 import shutil
@@ -210,6 +211,7 @@ class TestEgressWiring:
         assert int(_pid_file(egress_env).read_text()) != old_pid
 
 
+PROJECT_POLICY = '[secrets.BFTEST_PROJECT]\nhosts = ["example.org"]\nheader = "X-Project"\n'
 
 
 @pytest.fixture()
@@ -235,8 +237,44 @@ def _token_line(env):
     return lines[0].split("\t")
 
 
+def _approve(env, project_dir, body):
+    """Do what a Trust click does: keep an exact copy and the secret names"""
+    _, project_id, _ = _token_line(env)
+    trusted = _private(env) / "trusted"
+    trusted.mkdir(parents=True, exist_ok=True)
+    (trusted / f"{project_id}.toml").write_text(body)
+    names = re.findall(r"^\[secrets\.(\w+)\]", body, re.M)
+    (trusted / f"{project_id}.names").write_text("\n".join(names) + "\n")
+
+
 class TestProjectPolicies:
 
+    def _answer_in_a_terminal(self, env, project_dir, answer):
+        """Run secret-approve.sh with a terminal on stdin, as you would"""
+        main, child = pty.openpty()
+        proc = subprocess.Popen(["bash", str(SCRIPTS_DIR / "secret-approve.sh"), str(project_dir)],
+                                stdin=child, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+        os.close(child)
+        os.write(main, answer.encode())
+        out, err = proc.communicate(timeout=10)
+        os.close(main)
+        return out, err
+
+    @pytest.mark.parametrize("answer,kept_in", [("y\n", "trusted"), ("n\n", "denied")])
+    def test_answering_in_a_terminal_records_the_decision(self, egress_env, project, answer, kept_in):
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        run_guard(build_guard_input("echo hi"), egress_env, cwd=project)
+        _, project_id, _ = _token_line(egress_env)
+
+        out, err = self._answer_in_a_terminal(egress_env, project, answer)
+
+        kept = _private(egress_env) / kept_in / f"{project_id}.toml"
+        assert kept.read_text() == PROJECT_POLICY, f"out={out!r} err={err!r}"
+        assert not (_private(egress_env) / "pending" / f"{project_id}.toml").exists()
+        if kept_in == "trusted":
+            names = (_private(egress_env) / "trusted" / f"{project_id}.names").read_text()
+            assert names.split() == ["BFTEST_PROJECT"]
+            assert "BFTEST_PROJECT={{BFTEST_PROJECT}}" in wrap_through_guard("echo hi", egress_env, cwd=project)
 
     def test_each_project_gets_its_own_proxy_password(self, egress_env, project):
         first = wrap_through_guard("echo hi", egress_env, cwd=project)
@@ -249,10 +287,70 @@ class TestProjectPolicies:
         assert first == again
         assert oct((_private(egress_env) / "tokens.tsv").stat().st_mode & 0o777) == "0o600"
 
-    def test_sandbox_is_told_about_the_private_folder(self, egress_env, project):
+    def test_sandbox_is_told_about_the_private_folder_and_the_project_policy(self, egress_env, project):
         wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
 
         assert f"PRIVATE_DIR={_config_dir(egress_env).resolve()}/private" in wrapped
+        assert f"PROJECT_POLICY={project.resolve()}/.blindfold.toml" in wrapped
+
+    def test_new_project_policy_waits_for_approval(self, egress_env, project, tmp_path):
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+
+        result = run_guard(build_guard_input("echo hi"), egress_env, cwd=project)
+
+        assert result.returncode == 2
+        assert "waiting for your approval" in result.stderr
+        _, project_id, _ = _token_line(egress_env)
+        assert (_private(egress_env) / "pending" / f"{project_id}.toml").read_text() == PROJECT_POLICY
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "asked").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert (tmp_path / "asked").read_text().strip() == str(project.resolve()) or \
+            Path((tmp_path / "asked").read_text().strip()).resolve() == project.resolve()
+
+    def test_invalid_project_policy_is_refused_with_the_reason(self, egress_env, project, tmp_path):
+        (project / ".blindfold.toml").write_text('[secrets.X]\nhosts = ["*.a.com"]\nheader = "X"\n')
+
+        result = run_guard(build_guard_input("echo hi"), egress_env, cwd=project)
+
+        assert result.returncode == 2
+        assert "wildcards are not allowed" in result.stderr
+        assert not (tmp_path / "asked").exists(), "asked to approve a policy that can't load"
+
+    def test_approved_policy_adds_its_placeholders(self, egress_env, project):
+        wrap_through_guard("echo hi", egress_env, cwd=project)
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _approve(egress_env, project, PROJECT_POLICY)
+
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        assert "BFTEST_PROJECT={{BFTEST_PROJECT}}" in wrapped
+        assert f"SSL_CERT_FILE={_ca_bundle(egress_env)}" in wrapped
+        _, project_id, _ = _token_line(egress_env)
+        assert f"@{project_id}" in (_port_file(egress_env).parent / "policy.state").read_text()
+
+    def test_edited_policy_needs_approval_again(self, egress_env, project):
+        wrap_through_guard("echo hi", egress_env, cwd=project)
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _approve(egress_env, project, PROJECT_POLICY)
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY.replace("example.org", "evil.example"))
+
+        result = run_guard(build_guard_input("echo hi"), egress_env, cwd=project)
+
+        assert result.returncode == 2
+        assert "waiting for your approval" in result.stderr
+
+    def test_denied_policy_is_ignored(self, egress_env, project):
+        wrap_through_guard("echo hi", egress_env, cwd=project)
+        (project / ".blindfold.toml").write_text(PROJECT_POLICY)
+        _, project_id, _ = _token_line(egress_env)
+        denied = _private(egress_env) / "denied"
+        denied.mkdir(parents=True)
+        (denied / f"{project_id}.toml").write_text(PROJECT_POLICY)
+
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        assert "BFTEST_PROJECT" not in wrapped
 
 
 def _egress_sandbox_applies() -> bool:
@@ -321,6 +419,15 @@ class TestEgressRuntime:
         result = execute_wrapped(wrap_through_guard(f"cat {tokens}", egress_env, cwd=project))
 
         assert result.returncode != 0 and _token_line(egress_env)[0] not in result.stdout
+
+    def test_commands_cannot_write_the_project_policy(self, egress_env, project):
+        policy, fine = project / ".blindfold.toml", project / "fine.txt"
+        cmd = f"echo x > {policy}; echo x > {fine}"
+
+        result = execute_wrapped(wrap_through_guard(cmd, egress_env, cwd=project))
+
+        assert not policy.exists(), "a sandboxed command wrote the project policy"
+        assert fine.exists(), f"stderr={result.stderr!r}"
 
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     def test_https_goes_through_the_proxy_and_is_logged(self, egress_env):
