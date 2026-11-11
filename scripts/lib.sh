@@ -83,7 +83,7 @@ egress_enabled() {
 ensure_proxy() {
   local i
   PROXY_PORT=""
-  read -r PROXY_PORT <"$PROXY_PORT_FILE" 2>/dev/null
+  read -r PROXY_PORT 2>/dev/null <"$PROXY_PORT_FILE"
   if [[ -n "$PROXY_PORT" && -f "$POLICY_STATE" ]] &&
     { true <>"/dev/tcp/127.0.0.1/${PROXY_PORT}"; } 2>/dev/null; then
     return 0
