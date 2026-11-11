@@ -1,6 +1,6 @@
 # Design: binding secrets to their destinations
 
-Status: draft, 2026-11-10, updated 2026-11-11. Milestone 1 is built. Milestone 2 is built for the global policy; project policies and their approval are next.
+Status: draft, 2026-11-10, updated 2026-11-11. Milestones 1 and 2 are built.
 
 ## The problem
 
@@ -85,7 +85,9 @@ Hosts are exact. Wildcards are refused for now, since `*.github.io` or `*.ngrok.
 
 The value goes in one place: the named header, basic auth, or the named query parameter. The proxy replaces the placeholder inside whatever the client put in that slot, so `Bearer {{OPENAI_API_KEY}}` needs no extra setting. It never substitutes inside a request body. If it did, an agent could write the secret into a GitLab issue on an allowed host and read it back.
 
-A project policy is untrusted until you approve it. It sits in the repo, which means a cloned repo can ship one and the agent can edit one. So the first time the proxy sees a project policy, or sees it change, it shows a native dialog with the diff and stores the hash you approved in `~/.config/blindfold/trusted`. An unapproved policy is ignored, not half-applied. The sandbox also denies writes to `.blindfold.toml` and `~/.config/blindfold/`, so the agent can't quietly edit either one. Claude's Write and Edit tools run outside the sandbox, so the guard hook refuses them on those paths too, after resolving symlinks and `..`, and refuses a hard link whose other name is inside those folders. The write rule sits only in the egress profile: macOS won't apply a profile with file rules inside another sandbox, and the base profile has to keep working inside Claude Code's.
+A project policy is untrusted until you approve it. It sits in the repo, which means a cloned repo can ship one and the agent can edit one. So the first time the guard sees a project policy, or sees it change, it refuses the command and starts a native dialog in the background showing the file. The dialog can't run inside the hook, because Claude Code gives a hook five seconds. Approving stores an exact copy in `~/.config/blindfold/private/trusted/`, and the proxy only uses a project policy while the file still matches that copy byte for byte, which means bash never has to compute a hash, and a version you didn't see can't ride on one you approved. An unapproved policy is ignored, not half-applied. A project policy also can't change the rule for a secret the global policy names.
+
+The proxy is shared, so it needs to know which project a request comes from. The guard gives each project a random token and puts it in the proxy URL as a password (`http://blindfold:TOKEN@127.0.0.1:PORT`). Tokens live in `~/.config/blindfold/private/`, which the egress profile won't let commands read, and the guard keeps Read and Grep out of it. A request without a valid token gets the global policy only. The sandbox also denies writes to `.blindfold.toml` and `~/.config/blindfold/`, so the agent can't quietly edit either one. Claude's Write and Edit tools run outside the sandbox, so the guard hook refuses them on those paths too, after resolving symlinks and `..`, and refuses a hard link whose other name is inside those folders. The write rule sits only in the egress profile: macOS won't apply a profile with file rules inside another sandbox, and the base profile has to keep working inside Claude Code's.
 
 A secret with no policy can't go through the proxy at all. It can only be used through the old `secret-exec.sh` path, which warns about it.
 
