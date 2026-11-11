@@ -6,20 +6,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"sort"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 )
 
 // intercept terminates TLS for a policy host with a certificate from the local
 // CA, then checks and forwards each request on the connection. It is the only
 // place a real value is ever put into traffic.
-func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, st *policyState) {
-	cert, err := st.ca.leaf(host)
+func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, rules map[string]*Rule, ca *authority) {
+	cert, err := ca.leaf(host)
 	if err != nil {
 		http.Error(w, "cannot intercept", http.StatusInternalServerError)
 		p.log(Entry{Kind: "connect", Host: r.Host, Status: http.StatusInternalServerError, Error: err.Error()}, time.Now())
@@ -52,12 +52,14 @@ func (p *Proxy) intercept(w http.ResponseWriter, r *http.Request, host string, s
 		ErrorLog:  log.New(io.Discard, "", 0),
 	}
 	srv := &http.Server{
-		Handler:           p.checkAndInject(host, st.policy.RulesFor(host), forwarder),
+		Handler:           p.checkAndInject(host, rules, forwarder),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          log.New(io.Discard, "", 0),
 	}
-	srv.Serve(newOneConnListener(tlsConn))
+	// Serve returns once the listener is drained, but the connection keeps
+	// being served on its own goroutine until it closes
+	srv.Serve(&oneConnListener{conn: tlsConn})
 }
 
 func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, forwarder http.Handler) http.Handler {
@@ -105,85 +107,52 @@ func requestHost(r *http.Request) string {
 // header or another parameter, is sent as the literal placeholder. Returns the
 // names it filled in.
 func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string, error)) ([]string, error) {
-	names := make([]string, 0, len(rules))
-	for n := range rules {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-
 	var used []string
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(rules)) {
 		rule, ph := rules[name], placeholder(name)
-		var value string
-		fill := func(s string) (string, error) {
-			if value == "" {
-				v, err := lookup(name)
-				if err != nil {
-					return "", fmt.Errorf("could not read %s: %w", name, err)
-				}
-				if v == "" {
-					return "", fmt.Errorf("%s has no stored value", name)
-				}
-				value = v
-			}
-			return strings.ReplaceAll(s, ph, value), nil
-		}
+		hasPlaceholder := func(v string) bool { return strings.Contains(v, ph) }
 
+		// The slot's current values, and how to put filled ones back
+		var vals []string
+		var store func([]string)
 		switch {
 		case rule.Header != "":
-			vals := r.Header.Values(rule.Header)
-			if !anyContains(vals, ph) {
-				continue
-			}
-			filled := make([]string, len(vals))
-			for i, v := range vals {
-				var err error
-				if filled[i], err = fill(v); err != nil {
-					return used, err
-				}
-			}
-			r.Header[rule.Header] = filled
-
+			vals = r.Header.Values(rule.Header)
+			store = func(v []string) { r.Header[rule.Header] = v }
 		case rule.BasicAuth != nil:
 			user, pass, ok := r.BasicAuth()
-			if !ok || !strings.Contains(pass, ph) {
+			if !ok {
 				continue
 			}
-			if want := rule.BasicAuth.Username; want != "" && user != want {
+			if want := rule.BasicAuth.Username; want != "" && user != want && hasPlaceholder(pass) {
 				return used, fmt.Errorf("%s may only be used with username %q", name, want)
 			}
-			pass, err := fill(pass)
-			if err != nil {
-				return used, err
-			}
-			r.SetBasicAuth(user, pass)
-
+			vals = []string{pass}
+			store = func(v []string) { r.SetBasicAuth(user, v[0]) }
 		case rule.Query != "":
 			q := r.URL.Query()
-			vals := q[rule.Query]
-			if !anyContains(vals, ph) {
-				continue
-			}
-			for i, v := range vals {
-				var err error
-				if vals[i], err = fill(v); err != nil {
-					return used, err
-				}
-			}
-			r.URL.RawQuery = q.Encode()
+			vals = q[rule.Query]
+			store = func(v []string) { q[rule.Query] = v; r.URL.RawQuery = q.Encode() }
 		}
+		if !slices.ContainsFunc(vals, hasPlaceholder) {
+			continue
+		}
+
+		value, err := lookup(name)
+		if err != nil {
+			return used, fmt.Errorf("could not read %s: %w", name, err)
+		}
+		if value == "" {
+			return used, fmt.Errorf("%s has no stored value", name)
+		}
+		filled := make([]string, len(vals))
+		for i, v := range vals {
+			filled[i] = strings.ReplaceAll(v, ph, value)
+		}
+		store(filled)
 		used = append(used, name)
 	}
 	return used, nil
-}
-
-func anyContains(vals []string, s string) bool {
-	for _, v := range vals {
-		if strings.Contains(v, s) {
-			return true
-		}
-	}
-	return false
 }
 
 // bufferedConn reads through the bufio.Reader the hijack returned, which may
@@ -195,39 +164,17 @@ type bufferedConn struct {
 
 func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
-// oneConnListener hands one connection to an http.Server, then blocks Accept
-// until that connection closes so Serve returns when the tunnel is done.
-type oneConnListener struct {
-	conn net.Conn
-	once sync.Once
-	done chan struct{}
-}
-
-func newOneConnListener(c net.Conn) *oneConnListener {
-	return &oneConnListener{conn: c, done: make(chan struct{})}
-}
+// oneConnListener hands one connection to an http.Server. Serve calls Accept
+// from a single goroutine, so no locking is needed.
+type oneConnListener struct{ conn net.Conn }
 
 func (l *oneConnListener) Accept() (net.Conn, error) {
-	var c net.Conn
-	l.once.Do(func() { c = &notifyOnClose{Conn: l.conn, done: l.done} })
-	if c != nil {
+	if c := l.conn; c != nil {
+		l.conn = nil
 		return c, nil
 	}
-	<-l.done
 	return nil, net.ErrClosed
 }
 
 func (l *oneConnListener) Close() error   { return nil }
-func (l *oneConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
-
-type notifyOnClose struct {
-	net.Conn
-	done chan struct{}
-	once sync.Once
-}
-
-func (c *notifyOnClose) Close() error {
-	err := c.Conn.Close()
-	c.once.Do(func() { close(c.done) })
-	return err
-}
+func (l *oneConnListener) Addr() net.Addr { return &net.TCPAddr{} }

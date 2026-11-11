@@ -4,11 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -149,14 +149,7 @@ func checkHost(h string) error {
 }
 
 // Names returns the secret names in a stable order
-func (p *Policy) Names() []string {
-	names := make([]string, 0, len(p.Secrets))
-	for n := range p.Secrets {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return names
-}
+func (p *Policy) Names() []string { return slices.Sorted(maps.Keys(p.Secrets)) }
 
 // Hosts returns every host any rule names, sorted and without repeats
 func (p *Policy) Hosts() []string {
@@ -164,18 +157,15 @@ func (p *Policy) Hosts() []string {
 	for _, r := range p.Secrets {
 		hosts = append(hosts, r.Hosts...)
 	}
-	sort.Strings(hosts)
+	slices.Sort(hosts)
 	return slices.Compact(hosts)
 }
 
 // RulesFor returns the secrets that may be sent to host
 func (p *Policy) RulesFor(host string) map[string]*Rule {
-	var out map[string]*Rule
+	out := map[string]*Rule{}
 	for name, r := range p.Secrets {
 		if slices.Contains(r.Hosts, host) {
-			if out == nil {
-				out = map[string]*Rule{}
-			}
 			out[name] = r
 		}
 	}

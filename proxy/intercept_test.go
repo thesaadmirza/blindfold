@@ -391,3 +391,30 @@ func TestCAIsMadeAgainOnlyWhenHostsChange(t *testing.T) {
 		t.Fatalf("first=%p same=%p other=%p none=%p", first, same, other, none)
 	}
 }
+
+func TestEveryRequestOnAKeptAliveConnectionIsChecked(t *testing.T) {
+	h := newHarness(t, nil)
+
+	for i := 0; i < 3; i++ {
+		req := newRequest(t, "GET", "https://"+allowedHost+"/again", "")
+		req.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
+		if resp := h.do(req); resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status %d", i, resp.StatusCode)
+		}
+	}
+	sneaky := newRequest(t, "GET", "https://"+allowedHost+"/", "")
+	sneaky.Host = attackerHost
+	sneaky.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
+
+	if resp := h.do(sneaky); resp.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("a later request on the same connection got %d", resp.StatusCode)
+	}
+	for _, r := range h.allowed.requests() {
+		if r.Header.Get("Private-Token") != tokenValue {
+			t.Fatalf("request not filled: %+v", r)
+		}
+	}
+	if n := len(h.allowed.requests()); n != 3 {
+		t.Fatalf("upstream got %d requests, want 3", n)
+	}
+}

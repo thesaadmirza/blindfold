@@ -52,7 +52,7 @@ query = "key"
 	if got := p.RulesFor("gitlab.com"); len(got) != 2 {
 		t.Fatalf("rules for gitlab.com = %v", got)
 	}
-	if got := p.RulesFor("evil.example"); got != nil {
+	if got := p.RulesFor("evil.example"); len(got) != 0 {
 		t.Fatalf("rules for an unknown host = %v", got)
 	}
 }

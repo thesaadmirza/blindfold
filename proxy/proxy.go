@@ -104,8 +104,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 	if host, port, err := net.SplitHostPort(r.Host); err == nil && port == "443" {
 		host = strings.ToLower(host)
-		if st := p.state.Load(); st.ca != nil && st.policy.RulesFor(host) != nil {
-			p.intercept(w, r, host, st)
+		// SetPolicy makes a CA whenever any rule names a host
+		st := p.state.Load()
+		if rules := st.policy.RulesFor(host); len(rules) > 0 {
+			p.intercept(w, r, host, rules, st.ca)
 			return
 		}
 	}
