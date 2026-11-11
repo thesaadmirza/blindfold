@@ -186,9 +186,11 @@ is_protected_path() {
   # A hard link made inside the sandbox could give a protected file a second
   # name. Only multiply-linked files need the (slower) inode search.
   [[ -f "$path" ]] || return 1
-  links=$(stat -f %l "$path" 2>/dev/null || stat -c %h "$path" 2>/dev/null)
-  [[ "${links:-1}" -gt 1 ]] || return 1
-  inode=$(stat -f %i "$path" 2>/dev/null || stat -c %i "$path" 2>/dev/null)
+  # GNU stat first: on Linux `stat -f` means file system status and succeeds
+  # with unrelated output, while BSD stat simply rejects -c
+  read -r links inode < <(stat -c '%h %i' "$path" 2>/dev/null || stat -f '%l %i' "$path" 2>/dev/null)
+  [[ "$links" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ ]] || return 1
+  [[ "$links" -gt 1 ]] || return 1
   [[ -n "$(find "${PROTECTED_DIRS[@]}" -xdev -inum "$inode" -print -quit 2>/dev/null)" ]]
 }
 
