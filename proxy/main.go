@@ -10,15 +10,16 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"maps"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -66,8 +67,7 @@ func main() {
 	if err := w.reload(); err != nil {
 		log.Fatal(err)
 	}
-	// Short, so a project approved a moment ago is live by the agent's retry
-	go w.watch(250 * time.Millisecond)
+	go w.watch(time.Second)
 	if *portFile != "" {
 		port := ln.Addr().(*net.TCPAddr).Port
 		if err := writePortFile(*portFile, port); err != nil {
@@ -106,27 +106,29 @@ func stamp(path string) string {
 	return fmt.Sprint(info.Size(), info.ModTime().UnixNano())
 }
 
+// watch polls for changes, and reloads at once on SIGHUP, which the approval
+// script sends so a project approved a moment ago is live by the agent's retry
 func (w *policyWatcher) watch(every time.Duration) {
 	self, _ := os.Executable()
 	built := stamp(self)
-	for range time.Tick(every) {
-		if self != "" && stamp(self) != built {
-			os.Exit(0)
-		}
-		if w.stamp() != w.seen {
-			if err := w.reload(); err != nil {
-				log.Print(err)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	tick := time.NewTicker(every)
+	for {
+		select {
+		case <-tick.C:
+			if self != "" && stamp(self) != built {
+				os.Exit(0)
 			}
+			if w.stamp() == w.seen {
+				continue
+			}
+		case <-hup:
+		}
+		if err := w.reload(); err != nil {
+			log.Print(err)
 		}
 	}
-}
-
-func projectIDs(projects map[string]*Project) map[string]bool {
-	ids := map[string]bool{}
-	for _, p := range projects {
-		ids[p.ID] = true
-	}
-	return ids
 }
 
 // reload applies the policy file and writes what it loaded to the state file,
@@ -161,10 +163,16 @@ func (w *policyWatcher) reload() error {
 	for _, name := range pol.Names() {
 		state += name + "\n"
 	}
-	// "@id" for each approved project in effect, so the guard can wait for a
-	// project it just saw approved
-	for _, id := range slices.Sorted(maps.Keys(projectIDs(projects))) {
-		state += "@" + id + "\n"
+	// "@id NAME..." for each approved project in effect. The guard takes a
+	// project's placeholders from here, so it never exports one the proxy
+	// hasn't loaded.
+	var lines []string
+	for _, p := range projects {
+		lines = append(lines, "@"+strings.Join(append([]string{p.ID}, p.Policy.Names()...), " "))
+	}
+	slices.Sort(lines)
+	for _, l := range lines {
+		state += l + "\n"
 	}
 	return writeFileAtomic(w.state, []byte(state))
 }

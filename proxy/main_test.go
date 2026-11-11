@@ -99,7 +99,7 @@ func TestStateListsApprovedProjects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if s := readFile(t, w.state); s != "ok\nT\n@id1\n" {
+	if s := readFile(t, w.state); s != "ok\nT\n@id1 PROJECT_KEY\n" {
 		t.Fatalf("state = %q", s)
 	}
 	if ca := w.proxy.state.Load().ca; !slices.Contains(ca.hosts, "api.example.com") {
