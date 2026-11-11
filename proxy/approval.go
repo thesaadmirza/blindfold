@@ -22,55 +22,85 @@ func (r approvalRequest) key() approvalRequest {
 	return r
 }
 
+// answer is how an approval was decided
 type answer int
 
 const (
-	deny answer = iota
-	allowOnce
-	allowForAWhile
+	deny           answer = iota
+	allowOnce             // this request only
+	allowForAWhile        // this request, and a grant for grantLength
+	granted               // covered by an earlier grant
+	gaveUp                // the client went away before an answer
 )
 
+func (a answer) allowed() bool { return a == allowOnce || a == allowForAWhile || a == granted }
+
+func (a answer) String() string {
+	minutes := int(grantLength.Minutes())
+	switch a {
+	case allowOnce:
+		return "approved once"
+	case allowForAWhile:
+		return fmt.Sprintf("approved for %d minutes", minutes)
+	case granted:
+		return fmt.Sprintf("within a %d-minute approval", minutes)
+	case gaveUp:
+		return "the client gave up waiting"
+	}
+	return "denied"
+}
+
 // approver asks a person before a gated secret goes out, and remembers
-// "allow for 30 minutes" answers so the same kind of request doesn't ask
-// again. One dialog is on screen at a time. Identical requests that arrive
-// while one is being asked about wait for that answer: a deny or a grant
-// settles them all, "allow once" only the request it was asked for.
+// "allow for a while" answers so the same kind of request doesn't ask again.
+// One dialog is on screen at a time. Identical requests that arrive while one
+// is being asked about wait for that answer: a deny or a grant settles them
+// all, "allow once" only the request it was asked for.
 type approver struct {
-	ask func(approvalRequest) answer // shows the dialog and waits for it
+	ask func(context.Context, approvalRequest) answer // shows the dialog and waits for it
 	now func() time.Time
 
 	mu      sync.Mutex
 	grants  map[approvalRequest]time.Time
 	waiting map[approvalRequest]*pendingAnswer
-	dialog  sync.Mutex
+	dialog  chan struct{} // holds a token while a dialog is on screen
 }
 
 type pendingAnswer struct {
-	done    chan struct{}
-	ans     answer
-	waiters int // requests waiting on this answer besides the one asking
+	done chan struct{}
+	ans  answer
 }
 
-func newApprover(ask func(approvalRequest) answer) *approver {
-	return &approver{ask: ask, now: time.Now, grants: map[approvalRequest]time.Time{}, waiting: map[approvalRequest]*pendingAnswer{}}
+func newApprover(ask func(context.Context, approvalRequest) answer) *approver {
+	return &approver{
+		ask: ask, now: time.Now,
+		grants:  map[approvalRequest]time.Time{},
+		waiting: map[approvalRequest]*pendingAnswer{},
+		dialog:  make(chan struct{}, 1),
+	}
 }
 
-// approve reports whether req may go ahead, and how it was decided, for the
-// audit log
-func (a *approver) approve(req approvalRequest) (bool, string) {
+// approve decides whether req may go ahead. It gives up when ctx ends, so a
+// client that stops waiting doesn't leave a dialog or a queue behind.
+func (a *approver) approve(ctx context.Context, req approvalRequest) answer {
 	key := req.key()
 	for {
 		a.mu.Lock()
-		if until, ok := a.grants[key]; ok && a.now().Before(until) {
-			a.mu.Unlock()
-			return true, "within a 30-minute approval"
+		if until, ok := a.grants[key]; ok {
+			if a.now().Before(until) {
+				a.mu.Unlock()
+				return granted
+			}
+			delete(a.grants, key)
 		}
 		if w := a.waiting[key]; w != nil {
-			w.waiters++
 			a.mu.Unlock()
-			<-w.done
+			select {
+			case <-w.done:
+			case <-ctx.Done():
+				return gaveUp
+			}
 			if w.ans == deny {
-				return false, "denied"
+				return deny
 			}
 			continue // a grant covers this one; after "allow once", ask again
 		}
@@ -78,9 +108,13 @@ func (a *approver) approve(req approvalRequest) (bool, string) {
 		a.waiting[key] = w
 		a.mu.Unlock()
 
-		a.dialog.Lock()
-		ans := a.ask(req)
-		a.dialog.Unlock()
+		ans := gaveUp
+		select {
+		case a.dialog <- struct{}{}:
+			ans = a.ask(ctx, req)
+			<-a.dialog
+		case <-ctx.Done():
+		}
 
 		a.mu.Lock()
 		if ans == allowForAWhile {
@@ -90,42 +124,30 @@ func (a *approver) approve(req approvalRequest) (bool, string) {
 		w.ans = ans
 		close(w.done)
 		a.mu.Unlock()
-
-		switch ans {
-		case allowOnce:
-			return true, "approved once"
-		case allowForAWhile:
-			return true, "approved for 30 minutes"
-		}
-		return false, "denied"
+		return ans
 	}
 }
 
 // dialogAsk asks in a native dialog. No answer in time, or no screen to show
 // it on, is a deny.
-func dialogAsk(req approvalRequest) answer {
+func dialogAsk(ctx context.Context, req approvalRequest) answer {
 	msg := fmt.Sprintf("An agent wants to use %s.\n\nRequest: %s https://%s\nRequest path: %s",
 		req.Secret, req.Method, req.Host, oneLine(req.Path, 120))
 	if req.Project != "" {
 		msg += "\nProject: " + req.Project
 	}
-	msg += "\n\n\"Allow 30 min\" covers this secret, method and host for 30 minutes."
+	msg += fmt.Sprintf("\n\n\"Allow %d min\" covers this secret, method and host for %d minutes.",
+		int(grantLength.Minutes()), int(grantLength.Minutes()))
 
-	switch showDialog(context.Background(), msg, []string{"Deny", "Allow once", "Allow 30 min"}, dialogTimeout) {
+	grant := fmt.Sprintf("Allow %d min", int(grantLength.Minutes()))
+	switch showDialog(ctx, msg, []string{"Deny", "Allow once", grant}, dialogTimeout) {
 	case "Allow once":
 		return allowOnce
-	case "Allow 30 min":
+	case grant:
 		return allowForAWhile
 	}
-	return deny
-}
-
-// waitersFor reports how many requests are waiting on a dialog for req
-func (a *approver) waitersFor(req approvalRequest) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if w := a.waiting[req.key()]; w != nil {
-		return w.waiters
+	if ctx.Err() != nil {
+		return gaveUp
 	}
-	return 0
+	return deny
 }

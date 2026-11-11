@@ -167,9 +167,7 @@ func (r *Rule) validate() error {
 		return errors.New("set exactly one of header, basic_auth and query")
 	}
 	switch r.Approve {
-	case "":
-		r.Approve = approveNever
-	case approveNever, approveWrites, approveAlways:
+	case "", approveNever, approveWrites, approveAlways:
 	default:
 		return fmt.Errorf("approve %q: use never, writes or always", r.Approve)
 	}

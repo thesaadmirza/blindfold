@@ -152,7 +152,7 @@ func newHarness(t *testing.T, allowedHandler http.HandlerFunc) *harness {
 	h.proxy = NewProxy(func(e Entry) { h.entries <- e }, lookup)
 	// No test may open a real dialog: ones that expect a question swap in
 	// their own answers
-	h.proxy.approver = newApprover(func(req approvalRequest) answer {
+	h.proxy.approver = newApprover(func(_ context.Context, req approvalRequest) answer {
 		t.Errorf("unexpected approval dialog for %+v", req)
 		return deny
 	})
@@ -389,10 +389,7 @@ func TestPlainHTTPIsNeverFilled(t *testing.T) {
 
 func TestMissingValueFailsTheRequest(t *testing.T) {
 	h := newHarness(t, nil)
-	pol := &Policy{Secrets: map[string]*Rule{"UNSTORED": {Hosts: []string{allowedHost}, Header: "X-Key"}}}
-	if _, err := h.proxy.SetPolicies(pol, nil); err != nil {
-		t.Fatal(err)
-	}
+	h.withPolicy(&Policy{Secrets: map[string]*Rule{"UNSTORED": {Hosts: []string{allowedHost}, Header: "X-Key"}}})
 	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
 	req.Header.Set("X-Key", "{{UNSTORED}}")
 
@@ -463,6 +460,15 @@ const (
 	tokenA       = "token-for-a"
 	projectValue = "project-a-real-value"
 )
+
+// withPolicy swaps the global policy, keeping the same hosts so the CA the
+// harness's clients trust stays the same
+func (h *harness) withPolicy(pol *Policy) {
+	h.t.Helper()
+	if _, err := h.proxy.SetPolicies(pol, nil); err != nil {
+		h.t.Fatal(err)
+	}
+}
 
 // withProject adds project A's approved policy, on the same host so the CA
 // the harness's clients trust stays the same
@@ -657,14 +663,11 @@ func TestRefusalsAreAudited(t *testing.T) {
 // dialogs with ans and recording what was asked
 func gated(t *testing.T, ans answer) (*harness, *[]approvalRequest) {
 	h := newHarness(t, nil)
-	pol := &Policy{Secrets: map[string]*Rule{
+	h.withPolicy(&Policy{Secrets: map[string]*Rule{
 		"GITLAB_TOKEN": {Hosts: []string{allowedHost}, Header: "Private-Token", Approve: approveWrites},
-	}}
-	if _, err := h.proxy.SetPolicies(pol, nil); err != nil {
-		t.Fatal(err)
-	}
+	}})
 	var asked []approvalRequest
-	h.proxy.approver = newApprover(func(req approvalRequest) answer {
+	h.proxy.approver = newApprover(func(_ context.Context, req approvalRequest) answer {
 		asked = append(asked, req)
 		return ans
 	})
@@ -684,6 +687,9 @@ func TestDeniedWriteNeverReachesTheServer(t *testing.T) {
 
 	if resp.StatusCode != http.StatusForbidden || len(h.allowed.requests()) != 0 {
 		t.Fatalf("status %d, forwarded %d", resp.StatusCode, len(h.allowed.requests()))
+	}
+	if _, read := h.scopeOf["GITLAB_TOKEN"]; read {
+		t.Fatal("the value was read for a request that was denied")
 	}
 	want := approvalRequest{Secret: "GITLAB_TOKEN", Method: "POST", Host: allowedHost, Path: "/api/v4/issues"}
 	if len(*asked) != 1 || (*asked)[0] != want {

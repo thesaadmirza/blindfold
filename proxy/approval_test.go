@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,7 +13,7 @@ var postIssue = approvalRequest{Secret: "GITLAB_TOKEN", Method: "POST", Host: "g
 // scriptedApprover answers dialogs from a list, counting how many it showed
 func scriptedApprover(answers ...answer) (*approver, *atomic.Int32) {
 	var asked atomic.Int32
-	a := newApprover(func(approvalRequest) answer {
+	a := newApprover(func(context.Context, approvalRequest) answer {
 		n := asked.Add(1)
 		return answers[min(int(n), len(answers))-1]
 	})
@@ -22,25 +23,24 @@ func scriptedApprover(answers ...answer) (*approver, *atomic.Int32) {
 func TestAllowOnceCoversOneRequest(t *testing.T) {
 	a, asked := scriptedApprover(allowOnce, deny)
 
-	first, _ := a.approve(postIssue)
-	second, _ := a.approve(postIssue)
+	first := a.approve(context.Background(), postIssue)
+	second := a.approve(context.Background(), postIssue)
 
-	if !first || second || asked.Load() != 2 {
+	if first != allowOnce || second != deny || asked.Load() != 2 {
 		t.Fatalf("first=%v second=%v asked=%d", first, second, asked.Load())
 	}
 }
 
-func TestGrantCoversTheSameKindOfRequestFor30Minutes(t *testing.T) {
+func TestGrantCoversTheSameKindOfRequestForAWhile(t *testing.T) {
 	a, asked := scriptedApprover(allowForAWhile, deny)
 	now := time.Now()
 	a.now = func() time.Time { return now }
-	a.approve(postIssue)
+	a.approve(context.Background(), postIssue)
 
 	otherPath := postIssue
 	otherPath.Path = "/api/v4/issues/7/notes"
-	ok, how := a.approve(otherPath)
-	if !ok || how != "within a 30-minute approval" || asked.Load() != 1 {
-		t.Fatalf("ok=%v how=%q asked=%d", ok, how, asked.Load())
+	if got := a.approve(context.Background(), otherPath); got != granted || asked.Load() != 1 {
+		t.Fatalf("got %v, asked %d", got, asked.Load())
 	}
 
 	for name, other := range map[string]approvalRequest{
@@ -48,38 +48,34 @@ func TestGrantCoversTheSameKindOfRequestFor30Minutes(t *testing.T) {
 		"another secret": {Secret: "OTHER", Method: "POST", Host: "gitlab.com"},
 		"a project":      {Secret: "GITLAB_TOKEN", Method: "POST", Host: "gitlab.com", Project: "/work/a"},
 	} {
-		if ok, _ := a.approve(other); ok {
+		if got := a.approve(context.Background(), other); got.allowed() {
 			t.Errorf("%s rode on the grant", name)
 		}
 	}
 
-	now = now.Add(31 * time.Minute)
-	if ok, _ := a.approve(postIssue); ok {
-		t.Fatal("grant outlived 30 minutes")
+	now = now.Add(grantLength + time.Minute)
+	if got := a.approve(context.Background(), postIssue); got.allowed() {
+		t.Fatal("grant outlived its length")
 	}
 }
 
-// An agent firing the same request many times gets one dialog, not many
+// An agent firing the same request many times gets one dialog, not many.
+// The answer is a grant, so a request that arrives after the dialog closed
+// is covered too, and the count can't depend on timing.
 func TestIdenticalRequestsShareOneDialog(t *testing.T) {
 	release := make(chan struct{})
 	var asked atomic.Int32
-	a := newApprover(func(approvalRequest) answer {
+	a := newApprover(func(context.Context, approvalRequest) answer {
 		asked.Add(1)
 		<-release
-		return deny
+		return allowForAWhile
 	})
 
 	var wg sync.WaitGroup
-	results := make([]bool, 5)
+	results := make([]answer, 5)
 	for i := range results {
 		wg.Add(1)
-		go func() { defer wg.Done(); results[i], _ = a.approve(postIssue) }()
-	}
-	// Answer only once the other four are waiting on this dialog
-	for deadline := time.Now().Add(5 * time.Second); a.waitersFor(postIssue) < 4; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d requests waited on the dialog", a.waitersFor(postIssue))
-		}
+		go func() { defer wg.Done(); results[i] = a.approve(context.Background(), postIssue) }()
 	}
 	close(release)
 	wg.Wait()
@@ -87,9 +83,40 @@ func TestIdenticalRequestsShareOneDialog(t *testing.T) {
 	if asked.Load() != 1 {
 		t.Fatalf("asked %d times", asked.Load())
 	}
-	for i, ok := range results {
-		if ok {
-			t.Fatalf("request %d allowed after a deny", i)
+	for i, got := range results {
+		if !got.allowed() {
+			t.Fatalf("request %d: %v", i, got)
+		}
+	}
+}
+
+func TestClientThatGivesUpStopsWaiting(t *testing.T) {
+	a := newApprover(func(ctx context.Context, _ approvalRequest) answer {
+		<-ctx.Done() // a dialog nobody answers, closed when the request ends
+		return gaveUp
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if got := a.approve(ctx, postIssue); got.allowed() {
+		t.Fatalf("got %v", got)
+	}
+	if got := a.approve(ctx, postIssue); got.allowed() {
+		t.Fatalf("a request with a dead client got %v", got)
+	}
+}
+
+func TestAnswersDescribeThemselves(t *testing.T) {
+	want := map[answer]string{
+		deny:           "denied",
+		allowOnce:      "approved once",
+		allowForAWhile: "approved for 30 minutes",
+		granted:        "within a 30-minute approval",
+		gaveUp:         "the client gave up waiting",
+	}
+	for a, s := range want {
+		if a.String() != s {
+			t.Errorf("%d: %q", a, a.String())
 		}
 	}
 }
