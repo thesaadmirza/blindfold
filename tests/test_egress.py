@@ -80,6 +80,12 @@ def _write_policy(env, body):
     path.write_text(body)
 
 
+def _write_settings(env, body):
+    path = _config_dir(env) / "settings"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
 def _store_test_secret(env, keychain, name="BFTEST_TOKEN", value="bftest-real-value"):
     """Put a global test secret in a throwaway keychain and register its name,
     the way secret-store.sh would"""
@@ -149,6 +155,28 @@ class TestEgressWiring:
         assert str(BASE_PROFILE) in wrapped
         assert "HTTPS_PROXY" not in wrapped
 
+    def test_settings_file_turns_lockdown_on(self, egress_env):
+        egress_env.pop("BLINDFOLD_EGRESS")
+        _write_settings(egress_env, "# Blindfold\nBLINDFOLD_EGRESS=proxy\n")
+
+        assert str(EGRESS_PROFILE) in wrap_through_guard("echo hi", egress_env)
+
+    def test_environment_cannot_turn_off_what_the_settings_file_turned_on(self, egress_env):
+        egress_env["BLINDFOLD_EGRESS"] = ""
+        _write_settings(egress_env, "BLINDFOLD_EGRESS=proxy\n")
+
+        assert str(EGRESS_PROFILE) in wrap_through_guard("echo hi", egress_env)
+
+    @pytest.mark.parametrize("line", ["BLINDFOLD_EGRESS=off", "BLINDFOLD_EGRESS = proxy", "EGRESS=proxy"])
+    def test_a_setting_blindfold_does_not_know_is_refused(self, egress_env, line):
+        egress_env.pop("BLINDFOLD_EGRESS")
+        _write_settings(egress_env, line + "\n")
+
+        result = run_guard(build_guard_input("echo hi"), egress_env)
+
+        assert result.returncode == 2
+        assert line in result.stderr and "is not a setting Blindfold knows" in result.stderr
+
     def test_sandbox_is_told_which_folders_to_protect(self, egress_env):
         wrapped = wrap_through_guard("echo hi", egress_env)
 
@@ -187,6 +215,16 @@ class TestEgressWiring:
         assert result.returncode == 1
         assert "BFTEST_TOKEN has a policy" in result.stderr
         assert "{{BFTEST_TOKEN}}" in result.stderr, "the refusal should show the agent what to run instead"
+
+    def test_refusal_cannot_be_turned_off_from_the_environment(self, egress_env):
+        # Only the settings file counts, which the agent can't write
+        _write_policy(egress_env, POLICY)
+        egress_env["BLINDFOLD_EXEC_ANY_SECRET"] = "1"
+
+        result = run_script("secret-exec.sh", ["echo {{BFTEST_TOKEN}}"], env=egress_env)
+
+        assert result.returncode == 1
+        assert "BFTEST_TOKEN has a policy" in result.stderr
 
     def test_agent_cannot_turn_the_refusal_off_itself(self, egress_env):
         # Only the exact form of a call is exempt from the sandbox; with a
@@ -466,7 +504,7 @@ class TestEgressRuntime:
         _store_test_secret(egress_env, temp_keychain)
         if opt_out:
             _write_policy(egress_env, POLICY)
-            egress_env["BLINDFOLD_EXEC_ANY_SECRET"] = "1"
+            _write_settings(egress_env, "BLINDFOLD_EXEC_ANY_SECRET=1\n")
 
         result = run_script("secret-exec.sh", ["echo got {{BFTEST_TOKEN}}"], env=egress_env)
 
