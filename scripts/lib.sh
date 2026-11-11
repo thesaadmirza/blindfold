@@ -36,9 +36,7 @@ AUDIT_LOG="${BLINDFOLD_AUDIT_LOG:-${EGRESS_LOG%/*}/audit.jsonl}"
 # Blindfold's own switches, as NAME=value lines. It sits in CONFIG_DIR, which
 # the agent can't write under lockdown, so the agent can't turn them off.
 SETTINGS_FILE="${CONFIG_DIR}/settings"
-# Claude Code's user settings. They, a project's .claude/settings*.json and
-# the shell profiles Claude Code starts from switch the hooks and lockdown on,
-# so under lockdown the agent can't change them.
+# Claude Code's config folder
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # Cached values (computed once per script execution)
@@ -172,13 +170,17 @@ build_sandbox_argv() {
     fi
     protected_dirs
     kept_files
+    regex_of "${KEPT_FILES[@]}"
+    KEPT_REGEX="$REGEX"
     # The project's .claude is only kept once it exists, so commands can still make it
-    local project_settings=()
-    [[ -d "${PROJECT_DIR}/.claude" ]] && project_settings=("${PROJECT_DIR}/.claude/settings.json")
+    PARENTS=()
+    parents_of "${PROTECTED_DIRS[@]}" "${KEPT_FILES[@]}"
+    [[ -d "${PROJECT_DIR}/.claude" ]] && parents_of "${PROJECT_DIR}/.claude/settings.json"
+    regex_of "${PARENTS[@]}"
+    PARENTS_REGEX="$REGEX"
     SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
       -D "PRIVATE_DIR=${PRIVATE_REAL}" -D "PROJECT_POLICY=${PROJECT_DIR}/${PROJECT_POLICY_FILE}"
-      -D "CLAUDE_SETTINGS=^($(printf '%s\n' "${KEPT_FILES[@]}" | regex_of))(/.*)?\$"
-      -D "PARENT_DIRS=^($(parents_of "${PROTECTED_DIRS[@]}" "${KEPT_FILES[@]}" ${project_settings[@]+"${project_settings[@]}"} | regex_of))\$"
+      -D "CLAUDE_SETTINGS=^(${KEPT_REGEX})(/.*)?\$" -D "PARENT_DIRS=^(${PARENTS_REGEX})\$"
       -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
@@ -388,23 +390,32 @@ is_claude_settings_path() {
   is_project_settings "$RESOLVED_PATH"
 }
 
-# Prints every folder above the given paths, once each, so the sandbox can
-# keep them from being renamed or removed with what's protected inside
+# Adds to PARENTS every folder above the given paths, once each, so the
+# sandbox can keep them from being renamed or removed with what's inside.
+# Plain bash, since this runs on every command.
 parents_of() {
-  local p seen=$'\n'
+  local p seen
   for p in "$@"; do
     while p="${p%/*}"; [[ -n "$p" ]]; do
-      [[ "$seen" == *$'\n'"$p"$'\n'* ]] && break
-      seen+="${p}"$'\n'
-      echo "$p"
+      # A folder seen before has had its own parents added already
+      for seen in ${PARENTS[@]+"${PARENTS[@]}"}; do
+        [[ "$seen" == "$p" ]] && continue 3
+      done
+      PARENTS+=("$p")
     done
   done
 }
 
-# Joins the paths on stdin, one per line, into one regex alternation, each
-# matched literally
+# Sets REGEX to one alternation that matches each given path literally
 regex_of() {
-  sed 's/[][\.*^$+?(){}|]/\\&/g' | paste -sd '|' -
+  local p c
+  REGEX=""
+  for p in "$@"; do
+    for c in '\' . '[' ']' '*' '^' '$' + '?' '(' ')' '{' '}' '|'; do
+      p="${p//"$c"/\\$c}"
+    done
+    REGEX+="${REGEX:+|}${p}"
+  done
 }
 
 # True for the private folder, where reading a project token would let the
