@@ -22,14 +22,13 @@ POLICY_FILE="${BLINDFOLD_POLICY:-${CONFIG_DIR}/policy.toml}"
 PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-${CONFIG_DIR}/run/proxy.port}"
 CA_BUNDLE="${PROXY_PORT_FILE%/*}/ca-bundle.pem"
 # What the running proxy loaded: "ok" or "error", the global secret names,
-# then "@id" for each approved project in effect
+# then "@id NAME..." for each approved project in effect
 POLICY_STATE="${PROXY_PORT_FILE%/*}/policy.state"
+PROXY_PID_FILE="${PROXY_PORT_FILE%.port}.pid"
 # Project tokens and approved project policies. Sandboxed commands can neither
 # read nor write it.
 PRIVATE_DIR="${CONFIG_DIR}/private"
 PROJECT_POLICY_FILE=".blindfold.toml"
-# Tests swap in a stub so they never open a real dialog
-APPROVE_CMD="${BLINDFOLD_APPROVE_CMD:-${_SV_LIB_DIR}/secret-approve.sh}"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
@@ -97,7 +96,7 @@ ensure_proxy() {
     --service "$SERVICE" --account-prefix "$ACCOUNT_PREFIX")
   [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
   nohup "$PROXY_BIN" "${args[@]}" </dev/null >/dev/null 2>&1 &
-  echo "$!" >"${PROXY_PORT_FILE%.port}.pid"
+  echo "$!" >"$PROXY_PID_FILE"
   for ((i = 0; i < 100; i++)); do
     if [[ -s "$PROXY_PORT_FILE" ]]; then
       read -r PROXY_PORT <"$PROXY_PORT_FILE"
@@ -125,16 +124,20 @@ build_sandbox_argv() {
       EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent."
       return 1
     fi
-    project_token || return 1
+    # Fill get_project_path's cache here, not in a $(...) subshell where it
+    # would be lost, so git runs once per command
+    get_project_path >/dev/null
+    PROJECT_DIR=$(cd "$_SV_PROJECT_PATH" 2>/dev/null && pwd -P)
     check_project_policy || return 1
     names=(${STATE_NAMES[@]+"${STATE_NAMES[@]}"})
     for name in ${PROJECT_NAMES[@]+"${PROJECT_NAMES[@]}"}; do
       [[ " ${names[*]-} " == *" ${name} "* ]] || names+=("$name")
     done
 
-    # The token, as the proxy password, tells the proxy which project's
-    # approved policy applies
-    local url="http://blindfold:${PROJECT_TOKEN}@127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
+    # A project's token, as the proxy password, tells the proxy which approved
+    # project policy applies
+    local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
+    [[ -n "$PROJECT_TOKEN" ]] && url="http://blindfold:${PROJECT_TOKEN}@127.0.0.1:${PROXY_PORT}"
     SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
       "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts")
     if [[ ${#names[@]} -gt 0 ]]; then
@@ -150,10 +153,8 @@ build_sandbox_argv() {
       done
     fi
     protected_dirs
-    local project_real
-    project_real=$(cd "$(get_project_path)" 2>/dev/null && pwd -P)
     SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
-      -D "PRIVATE_DIR=${PROTECTED_DIRS[0]}/private" -D "PROJECT_POLICY=${project_real}/${PROJECT_POLICY_FILE}"
+      -D "PRIVATE_DIR=${PRIVATE_REAL}" -D "PROJECT_POLICY=${PROJECT_DIR}/${PROJECT_POLICY_FILE}"
       -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
@@ -162,7 +163,7 @@ build_sandbox_argv() {
 
 # Reads what the running proxy loaded into STATE_STATUS ("ok" or "error"),
 # STATE_DETAIL (the error), STATE_NAMES (global secrets) and STATE_PROJECTS
-# (ids of approved projects in effect)
+# ("id NAME..." for each approved project in effect)
 read_policy_state() {
   local line
   STATE_STATUS="" STATE_DETAIL="" STATE_NAMES=() STATE_PROJECTS=()
@@ -178,50 +179,67 @@ read_policy_state() {
   } <"$POLICY_STATE"
 }
 
+# Sets PROJECT_NAMES to the secrets of the approved project with id $1, if
+# the running proxy has it loaded
+loaded_project_names() {
+  local entry
+  PROJECT_NAMES=()
+  for entry in ${STATE_PROJECTS[@]+"${STATE_PROJECTS[@]}"}; do
+    if [[ "${entry%% *}" == "$1" ]]; then
+      read -ra PROJECT_NAMES <<<"${entry#"$1"}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 random_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 
-# Sets PROJECT_TOKEN and PROJECT_ID for this project, making them the first
-# time. The token is the project's proxy password and stays secret; the id
+# Sets PROJECT_TOKEN and PROJECT_ID for the project at real path $1, if it has
+# them. The token is the project's proxy password and stays secret; the id
 # only names the project's files in PRIVATE_DIR.
-project_token() {
-  local project token id path tokens="${PRIVATE_DIR}/tokens.tsv"
-  project=$(get_project_path)
+find_project_token() {
+  local token id path
   PROJECT_TOKEN="" PROJECT_ID=""
-  if [[ -f "$tokens" ]]; then
-    while IFS=$'\t' read -r token id path; do
-      if [[ "$path" == "$project" ]]; then
-        PROJECT_TOKEN="$token" PROJECT_ID="$id"
-        return 0
-      fi
-    done <"$tokens"
-  fi
+  [[ -f "${PRIVATE_DIR}/tokens.tsv" ]] || return 1
+  while IFS=$'\t' read -r token id path; do
+    if [[ "$path" == "$1" ]]; then
+      PROJECT_TOKEN="$token" PROJECT_ID="$id"
+      return 0
+    fi
+  done <"${PRIVATE_DIR}/tokens.tsv"
+  return 1
+}
+
+# Like find_project_token, but makes them the first time
+project_token() {
+  find_project_token "$1" && return 0
   mkdir -p -m 700 "$PRIVATE_DIR"
   PROJECT_TOKEN=$(random_hex 16) PROJECT_ID=$(random_hex 6)
   [[ ${#PROJECT_TOKEN} -eq 32 && ${#PROJECT_ID} -eq 12 ]] || return 1
-  (umask 077 && printf '%s\t%s\t%s\n' "$PROJECT_TOKEN" "$PROJECT_ID" "$project" >>"$tokens")
+  (umask 077 && printf '%s\t%s\t%s\n' "$PROJECT_TOKEN" "$PROJECT_ID" "$1" >>"${PRIVATE_DIR}/tokens.tsv")
 }
 
-# Checks this project's .blindfold.toml against what the user decided, and
-# sets PROJECT_NAMES to its secret names once it's approved. A denied policy
-# is ignored. A new or changed one gets the approval dialog, and commands are
-# refused (with EGRESS_SETUP_ERROR set) until the user answers, so the agent
-# can't run ahead without the secrets it expects.
+# Checks PROJECT_DIR's .blindfold.toml against what the user decided. Once
+# it's approved, sets PROJECT_TOKEN and PROJECT_NAMES from what the proxy
+# loaded. A denied policy is ignored. A new or changed one gets the approval
+# dialog, and commands are refused (with EGRESS_SETUP_ERROR set) until the
+# user answers, so the agent can't run ahead without the secrets it expects.
+# A project without a policy gets no token at all.
 check_project_policy() {
-  local file project i names name
-  project=$(get_project_path)
-  file="${project}/${PROJECT_POLICY_FILE}"
-  local trusted="${PRIVATE_DIR}/trusted/${PROJECT_ID}" pending="${PRIVATE_DIR}/pending/${PROJECT_ID}"
-  PROJECT_NAMES=()
+  local file="${PROJECT_DIR}/${PROJECT_POLICY_FILE}" i err
+  PROJECT_TOKEN="" PROJECT_ID="" PROJECT_NAMES=()
   [[ -f "$file" ]] || return 0
+  project_token "$PROJECT_DIR" || return 1
+  local pending="${PRIVATE_DIR}/pending/${PROJECT_ID}.toml"
 
-  if cmp -s "$file" "${trusted}.toml"; then
-    while IFS= read -r name; do
-      [[ -n "$name" ]] && PROJECT_NAMES+=("$name")
-    done <"${trusted}.names"
-    # The proxy picks up an approval within a quarter second. Wait for it, so
-    # the first command after approving already trusts the right CA.
-    for ((i = 0; i < 40; i++)); do
-      [[ " ${STATE_PROJECTS[*]-} " == *" ${PROJECT_ID} "* ]] && return 0
+  if cmp -s "$file" "${PRIVATE_DIR}/trusted/${PROJECT_ID}.toml"; then
+    # The approval script signals the proxy to reload, so this is normally
+    # there on the first look, and the proxy's own check each second catches
+    # it otherwise. Until it's loaded, the project's placeholders aren't
+    # exported, since the proxy wouldn't fill them in anyway.
+    for ((i = 0; i < 24; i++)); do
+      loaded_project_names "$PROJECT_ID" && return 0
       sleep 0.05
       read_policy_state
     done
@@ -229,24 +247,24 @@ check_project_policy() {
   fi
   cmp -s "$file" "${PRIVATE_DIR}/denied/${PROJECT_ID}.toml" && return 0
 
-  if ! cmp -s "$file" "${pending}.toml"; then
-    if ! names=$("$PROXY_BIN" -check "$file" 2>&1); then
-      EGRESS_SETUP_ERROR="This project's ${PROJECT_POLICY_FILE} is not valid: ${names}"
+  if ! cmp -s "$file" "$pending"; then
+    if ! err=$("$PROXY_BIN" -check "$file" 2>&1 >/dev/null); then
+      EGRESS_SETUP_ERROR="This project's ${PROJECT_POLICY_FILE} is not valid: ${err}"
       EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent."
       return 1
     fi
     mkdir -p -m 700 "${PRIVATE_DIR}/pending"
-    cp "$file" "${pending}.toml" && printf '%s\n' "$names" >"${pending}.names" || return 1
-    nohup bash "$APPROVE_CMD" "$project" </dev/null >/dev/null 2>&1 &
+    cp "$file" "$pending" || return 1
+    nohup bash "${_SV_LIB_DIR}/secret-approve.sh" "$PROJECT_DIR" </dev/null >/dev/null 2>&1 &
   fi
   EGRESS_SETUP_ERROR="This project's ${PROJECT_POLICY_FILE} is waiting for your approval in a Blindfold dialog."
-  EGRESS_SETUP_HINT="Approve or deny it there, then run the command again. Without a dialog, run: bash ${_SV_LIB_DIR}/secret-approve.sh ${project}"
+  EGRESS_SETUP_HINT="Approve or deny it there, then run the command again. Without a dialog, run: bash ${_SV_LIB_DIR}/secret-approve.sh ${PROJECT_DIR}"
   return 1
 }
 
-# Sets PROTECTED_DIRS to the real paths of CONFIG_DIR and INSTALL_DIR, once
-# per run. They're created first, since Seatbelt matches resolved paths and
-# the profile needs ones that exist.
+# Sets PROTECTED_DIRS to the real paths of CONFIG_DIR and INSTALL_DIR, and
+# PRIVATE_REAL to PRIVATE_DIR's, once per run. They're created first, since
+# Seatbelt matches resolved paths and the profile needs ones that exist.
 protected_dirs() {
   [[ ${#PROTECTED_DIRS[@]} -gt 0 ]] && return 0
   local d
@@ -254,6 +272,7 @@ protected_dirs() {
     [[ -d "$d" ]] || mkdir -p "$d" 2>/dev/null
     PROTECTED_DIRS+=("$(cd "$d" 2>/dev/null && pwd -P)")
   done
+  PRIVATE_REAL="${PROTECTED_DIRS[0]}${PRIVATE_DIR#"$CONFIG_DIR"}"
 }
 
 # Sets RESOLVED_PATH to path with symlinks and .. resolved, following a
@@ -308,7 +327,7 @@ is_protected_path() {
 # agent pass for that project
 is_private_path() {
   protected_dirs
-  path_is_inside "$1" "${PROTECTED_DIRS[0]}/private"
+  path_is_inside "$1" "$PRIVATE_REAL"
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
