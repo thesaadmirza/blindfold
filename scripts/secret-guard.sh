@@ -49,7 +49,7 @@ fi
 # Read: refuse a file that contains any stored value, e.g. one a command wrote
 # a secret into. Checked before the read, since output can't be redacted after.
 if [[ "$TOOL_NAME" == "Read" ]]; then
-  FILE_PATH=$(jq -r '.tool_input.file_path // ""' <<< "$INPUT" 2>/dev/null)
+  # FILE_PATH was read above, with the private-folder check
   [[ -f "$FILE_PATH" && -r "$FILE_PATH" ]] || exit 0
 
   CONTENT=$(<"$FILE_PATH")
