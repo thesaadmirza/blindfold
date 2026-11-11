@@ -39,7 +39,7 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Handler:           NewProxy(record),
+		Handler:           NewProxy(record, nil),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
