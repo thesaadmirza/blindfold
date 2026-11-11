@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDialogReplies(t *testing.T) {
@@ -48,5 +49,15 @@ func TestOneLineKeepsToOneLine(t *testing.T) {
 
 	if strings.ContainsAny(got, "\n\r") || len([]rune(got)) > 123 {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// The safe button is drawn rightmost and answers Return and Escape
+func TestSafeButtonIsRightmostAndTheDefault(t *testing.T) {
+	got := dialogScript([]string{"Deny", "Allow once", "Allow 30 min"}, 60*time.Second)
+
+	want := `buttons {"Allow 30 min", "Allow once", "Deny"} default button "Deny" cancel button "Deny" giving up after 60`
+	if !strings.Contains(got, want) {
+		t.Fatalf("got %s", got)
 	}
 }

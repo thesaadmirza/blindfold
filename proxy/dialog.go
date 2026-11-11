@@ -14,22 +14,29 @@ import (
 const maxDialogText = 1800
 
 // showDialog shows a native macOS dialog and returns the button clicked. The
-// first button is the default and the cancel button, so Return or Escape
-// picks it. No answer in time, no screen, or any other failure returns "".
+// first button is the safe one: it's the default and the cancel button, so
+// Return or Escape picks it, and it's drawn rightmost, where people click
+// out of habit. No answer in time, no screen, or any other failure returns "".
 // It is the only dialog Blindfold shows: secret-approve.sh calls it through
 // the -dialog flag, so both read answers and clean up text the same way.
 func showDialog(ctx context.Context, message string, buttons []string, timeout time.Duration) string {
-	quoted := make([]string, len(buttons))
-	for i, b := range buttons {
-		quoted[i] = fmt.Sprintf("%q", b)
-	}
-	script := fmt.Sprintf(`display dialog (item 1 of argv) with title "Blindfold" buttons {%s} default button %s cancel button %s giving up after %d with icon caution`,
-		strings.Join(quoted, ", "), quoted[0], quoted[0], int(timeout.Seconds()))
-
 	ctx, cancel := context.WithTimeout(ctx, timeout+5*time.Second)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, "osascript", "-e", "on run argv", "-e", script, "-e", "end run", dialogText(message)).CombinedOutput()
+	out, _ := exec.CommandContext(ctx, "osascript", "-e", "on run argv", "-e", dialogScript(buttons, timeout), "-e", "end run",
+		dialogText(message)).CombinedOutput()
 	return parseDialogReply(string(out), buttons)
+}
+
+// dialogScript is the AppleScript for showDialog. macOS draws buttons left to
+// right in list order, so the safe one goes last.
+func dialogScript(buttons []string, timeout time.Duration) string {
+	quoted := make([]string, len(buttons))
+	for i, b := range buttons {
+		quoted[len(buttons)-1-i] = fmt.Sprintf("%q", b)
+	}
+	safe := quoted[len(quoted)-1]
+	return fmt.Sprintf(`display dialog (item 1 of argv) with title "Blindfold" buttons {%s} default button %s cancel button %s giving up after %d with icon caution`,
+		strings.Join(quoted, ", "), safe, safe, int(timeout.Seconds()))
 }
 
 // parseDialogReply turns osascript's output into the button clicked. The
