@@ -27,6 +27,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "loopback address to listen on")
 	portFile := flag.String("port-file", "", "write the chosen port to this file (mode 600)")
 	logPath := flag.String("log", "", "append one JSON line per connection to this file")
+	auditPath := flag.String("audit", "", "append one JSON line per secret used or refused to this file")
 	policyPath := flag.String("policy", "", "policy file saying where each secret may go")
 	stateFile := flag.String("state", "", "write the loaded policy's secret names, or its error, to this file")
 	private := flag.String("private", "", "folder with project tokens and approved project policies")
@@ -61,7 +62,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	audit, err := openJSONL[AuditEntry](*auditPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 	proxy := NewProxy(record, keychainLookup(*keychain, *service, *accountPrefix))
+	proxy.audit = audit
 	w := &policyWatcher{proxy: proxy, path: *policyPath, private: *private, state: *stateFile, bundle: *bundlePath, roots: *systemRoots}
 	// The state and bundle have to exist before the port file says the proxy is up
 	if err := w.reload(); err != nil {

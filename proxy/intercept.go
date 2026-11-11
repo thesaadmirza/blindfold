@@ -68,11 +68,16 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 		e := Entry{Kind: "https", Host: host, Method: r.Method}
 		start := time.Now()
 		defer func() { p.log(e, start) }()
+		audit := func(decision, name string, status int, detail string) {
+			p.auditLog(AuditEntry{Decision: decision, Secret: name, Project: scopes[name], Method: r.Method,
+				Host: host, Path: r.URL.Path, Status: status, Detail: detail})
+		}
 
 		// The request has to be for the host the tunnel was opened to, or a
 		// client could open gitlab.com and then ask for something else
 		if target := requestHost(r); target != host {
 			e.Status, e.Error = http.StatusMisdirectedRequest, fmt.Sprintf("request for %s inside a tunnel to %s", target, host)
+			audit(auditWrongHost, "", e.Status, "asked for "+target)
 			http.Error(w, "Blindfold: request host does not match the tunnel", e.Status)
 			return
 		}
@@ -80,12 +85,25 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 		e.Secrets = used
 		if err != nil {
 			e.Status, e.Error = http.StatusBadGateway, err.Error()
+			if ref, ok := err.(*refusal); ok {
+				audit(ref.decision, ref.secret, e.Status, "")
+			}
 			http.Error(w, "Blindfold: "+err.Error(), e.Status)
 			return
 		}
+		// Placeholders left over were somewhere their rule doesn't name
+		for _, name := range placeholdersIn(r) {
+			if rules[name] != nil {
+				audit(auditOutsideSlot, name, 0, "")
+			}
+		}
+
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		forwarder.ServeHTTP(rec, r)
 		e.Status = rec.status
+		for _, name := range used {
+			audit(auditFilled, name, e.Status, "")
+		}
 	})
 }
 
@@ -126,7 +144,7 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 				continue
 			}
 			if want := rule.BasicAuth.Username; want != "" && user != want && hasPlaceholder(pass) {
-				return used, fmt.Errorf("%s may only be used with username %q", name, want)
+				return used, &refusal{name, auditWrongUser, fmt.Sprintf("%s may only be used with username %q", name, want)}
 			}
 			vals = []string{pass}
 			store = func(v []string) { r.SetBasicAuth(user, v[0]) }
@@ -140,11 +158,11 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 		}
 
 		value, err := lookup(name)
-		if err != nil {
-			return used, fmt.Errorf("could not read %s: %w", name, err)
+		if err == nil && value == "" {
+			err = fmt.Errorf("it's empty")
 		}
-		if value == "" {
-			return used, fmt.Errorf("%s has no stored value", name)
+		if err != nil {
+			return used, &refusal{name, auditMissing, fmt.Sprintf("could not read %s: %v", name, err)}
 		}
 		filled := make([]string, len(vals))
 		for i, v := range vals {
@@ -155,6 +173,11 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 	}
 	return used, nil
 }
+
+// refusal is why inject turned a request away, for the audit log
+type refusal struct{ secret, decision, msg string }
+
+func (e *refusal) Error() string { return e.msg }
 
 // bufferedConn reads through the bufio.Reader the hijack returned, which may
 // already hold the start of the TLS handshake
