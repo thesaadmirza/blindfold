@@ -57,7 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	record, err := openEgressLog(*logPath)
+	record, err := openJSONL[Entry](*logPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -231,11 +231,11 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// openEgressLog returns a recorder that appends JSON lines to path. An empty
-// path records nothing.
-func openEgressLog(path string) (func(Entry), error) {
+// openJSONL returns a recorder that appends one JSON line per value to path.
+// An empty path records nothing.
+func openJSONL[T any](path string) (func(T), error) {
 	if path == "" {
-		return func(Entry) {}, nil
+		return func(T) {}, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -246,11 +246,11 @@ func openEgressLog(path string) (func(Entry), error) {
 	}
 	var mu sync.Mutex
 	enc := json.NewEncoder(f)
-	return func(e Entry) {
+	return func(v T) {
 		mu.Lock()
 		defer mu.Unlock()
-		if err := enc.Encode(e); err != nil {
-			log.Printf("egress log: %v", err)
+		if err := enc.Encode(v); err != nil {
+			log.Printf("%s: %v", path, err)
 		}
 	}, nil
 }
