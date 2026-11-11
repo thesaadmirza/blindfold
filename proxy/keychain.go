@@ -14,11 +14,26 @@ const (
 	missCacheTTL  = 5 * time.Second
 )
 
-// keychainLookup reads global secrets the way lib.sh stores them: service
-// and account prefix come from the guard so the two can't drift apart.
-// Values are cached for a minute so a burst of requests doesn't run
-// `security` each time, and a rotated secret is picked up soon after.
-func keychainLookup(keychain, service, accountPrefix string) func(string) (string, error) {
+// keychainLookup reads secrets the way lib.sh stores them, under the account
+// PREFIX:SCOPE:NAME, where SCOPE is a project path or "global". Service and
+// prefix come from the guard so the two can't drift apart. With a project
+// scope, the project's own value wins over a global one, as in lib.sh.
+func keychainLookup(keychain, service, accountPrefix string) func(scope, name string) (string, error) {
+	read := cachedKeychainRead(keychain, service)
+	return func(scope, name string) (string, error) {
+		if scope != "" {
+			if v, err := read(accountPrefix + ":" + scope + ":" + name); err == nil {
+				return v, nil
+			}
+		}
+		return read(accountPrefix + ":global:" + name)
+	}
+}
+
+// cachedKeychainRead returns one account's value. Values are cached for a
+// minute so a burst of requests doesn't run `security` each time, and a
+// rotated secret is picked up soon after.
+func cachedKeychainRead(keychain, service string) func(account string) (string, error) {
 	type entry struct {
 		mu    sync.Mutex
 		value string
@@ -28,12 +43,12 @@ func keychainLookup(keychain, service, accountPrefix string) func(string) (strin
 	var mu sync.Mutex
 	entries := map[string]*entry{}
 
-	return func(name string) (string, error) {
+	return func(account string) (string, error) {
 		mu.Lock()
-		e, ok := entries[name]
+		e, ok := entries[account]
 		if !ok {
 			e = &entry{}
-			entries[name] = e
+			entries[account] = e
 		}
 		mu.Unlock()
 
@@ -49,7 +64,7 @@ func keychainLookup(keychain, service, accountPrefix string) func(string) (strin
 			return e.value, e.err
 		}
 
-		args := []string{"find-generic-password", "-a", accountPrefix + name, "-s", service, "-w"}
+		args := []string{"find-generic-password", "-a", account, "-s", service, "-w"}
 		if keychain != "" {
 			args = append(args, keychain)
 		}

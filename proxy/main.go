@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,12 +26,27 @@ func main() {
 	logPath := flag.String("log", "", "append one JSON line per connection to this file")
 	policyPath := flag.String("policy", "", "policy file saying where each secret may go")
 	stateFile := flag.String("state", "", "write the loaded policy's secret names, or its error, to this file")
+	private := flag.String("private", "", "folder with project tokens and approved project policies")
+	check := flag.String("check", "", "check this policy file, print the secret names it covers and exit")
 	bundlePath := flag.String("ca-bundle", "", "write the system roots plus the local CA to this file")
 	systemRoots := flag.String("system-roots", "/etc/ssl/cert.pem", "PEM file with the roots clients normally trust")
 	keychain := flag.String("keychain", "", "keychain to read secrets from (default: the login keychain)")
 	service := flag.String("service", "claude-secrets", "keychain service secrets are stored under")
-	accountPrefix := flag.String("account-prefix", "claude-secret:global:", "prefix of a secret's keychain account")
+	accountPrefix := flag.String("account-prefix", "claude-secret", "keychain accounts are PREFIX:SCOPE:NAME")
 	flag.Parse()
+
+	if *check != "" {
+		data, err := os.ReadFile(*check)
+		if err == nil {
+			var pol *Policy
+			if pol, err = ParsePolicy(data); err == nil {
+				fmt.Println(strings.Join(pol.Names(), "\n"))
+				return
+			}
+		}
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	ln, err := listenLoopback(*listen)
 	if err != nil {
@@ -41,12 +57,13 @@ func main() {
 		log.Fatal(err)
 	}
 	proxy := NewProxy(record, keychainLookup(*keychain, *service, *accountPrefix))
-	w := &policyWatcher{proxy: proxy, path: *policyPath, state: *stateFile, bundle: *bundlePath, roots: *systemRoots}
+	w := &policyWatcher{proxy: proxy, path: *policyPath, private: *private, state: *stateFile, bundle: *bundlePath, roots: *systemRoots}
 	// The state and bundle have to exist before the port file says the proxy is up
 	if err := w.reload(); err != nil {
 		log.Fatal(err)
 	}
-	go w.watch(time.Second)
+	// Short, so a project approved a moment ago is live by the agent's retry
+	go w.watch(250 * time.Millisecond)
 	if *portFile != "" {
 		port := ln.Addr().(*net.TCPAddr).Port
 		if err := writePortFile(*portFile, port); err != nil {
@@ -62,16 +79,19 @@ func main() {
 	log.Fatal(srv.Serve(ln))
 }
 
-// policyWatcher reloads the policy when its file changes, and stops the proxy
-// when its own binary is rebuilt so the guard starts the new one
+// policyWatcher reloads the policies when their files change, and stops the
+// proxy when its own binary is rebuilt so the guard starts the new one
 type policyWatcher struct {
-	proxy  *Proxy
-	path   string
-	state  string
-	bundle string
-	roots  string
-	seen   string // stamp of the policy file at the last load
+	proxy   *Proxy
+	path    string
+	private string
+	state   string
+	bundle  string
+	roots   string
+	seen    string // stamp of every policy file at the last load
 }
+
+func (w *policyWatcher) stamp() string { return stamp(w.path) + "#" + projectsStamp(w.private) }
 
 // stamp changes whenever a file is written, replaced or removed
 func stamp(path string) string {
@@ -89,7 +109,7 @@ func (w *policyWatcher) watch(every time.Duration) {
 		if self != "" && stamp(self) != built {
 			os.Exit(0)
 		}
-		if stamp(w.path) != w.seen {
+		if w.stamp() != w.seen {
 			if err := w.reload(); err != nil {
 				log.Print(err)
 			}
@@ -103,13 +123,13 @@ func (w *policyWatcher) watch(every time.Duration) {
 // rather than keeping rules the user meant to change. The error returned is
 // only for files the proxy couldn't write.
 func (w *policyWatcher) reload() error {
-	w.seen = stamp(w.path)
+	w.seen = w.stamp()
 	pol, loadErr := LoadPolicy(w.path)
 	if loadErr != nil {
 		log.Print(loadErr)
 		pol = &Policy{}
 	}
-	ca, err := w.proxy.SetPolicy(pol)
+	ca, err := w.proxy.SetPolicies(pol, loadProjects(w.private))
 	if err != nil {
 		return err
 	}
