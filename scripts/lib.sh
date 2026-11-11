@@ -30,6 +30,8 @@ PROXY_PID_FILE="${PROXY_PORT_FILE%.port}.pid"
 PRIVATE_DIR="${CONFIG_DIR}/private"
 PROJECT_POLICY_FILE=".blindfold.toml"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
+# One line per secret filled in, echoed back or refused
+AUDIT_LOG="${BLINDFOLD_AUDIT_LOG:-${EGRESS_LOG%/*}/audit.jsonl}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
@@ -91,7 +93,7 @@ ensure_proxy() {
 
   mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
   rm -f "$PROXY_PORT_FILE" "$POLICY_STATE"
-  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE"
+  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --audit "$AUDIT_LOG" --policy "$POLICY_FILE"
     --state "$POLICY_STATE" --private "$PRIVATE_DIR" --ca-bundle "$CA_BUNDLE"
     --service "$SERVICE" --account-prefix "$ACCOUNT_PREFIX")
   [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
