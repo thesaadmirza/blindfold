@@ -171,8 +171,14 @@ build_sandbox_argv() {
       done
     fi
     protected_dirs
+    kept_files
+    # The project's .claude is only kept once it exists, so commands can still make it
+    local project_settings=()
+    [[ -d "${PROJECT_DIR}/.claude" ]] && project_settings=("${PROJECT_DIR}/.claude/settings.json")
     SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
       -D "PRIVATE_DIR=${PRIVATE_REAL}" -D "PROJECT_POLICY=${PROJECT_DIR}/${PROJECT_POLICY_FILE}"
+      -D "CLAUDE_SETTINGS=^($(printf '%s\n' "${KEPT_FILES[@]}" | regex_of))(/.*)?\$"
+      -D "PARENT_DIRS=^($(parents_of "${PROTECTED_DIRS[@]}" "${KEPT_FILES[@]}" ${project_settings[@]+"${project_settings[@]}"} | regex_of))\$"
       -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
@@ -380,6 +386,25 @@ is_claude_settings_path() {
   kept_files
   path_is_inside "$1" "${KEPT_FILES[@]}" && return 0
   is_project_settings "$RESOLVED_PATH"
+}
+
+# Prints every folder above the given paths, once each, so the sandbox can
+# keep them from being renamed or removed with what's protected inside
+parents_of() {
+  local p seen=$'\n'
+  for p in "$@"; do
+    while p="${p%/*}"; [[ -n "$p" ]]; do
+      [[ "$seen" == *$'\n'"$p"$'\n'* ]] && break
+      seen+="${p}"$'\n'
+      echo "$p"
+    done
+  done
+}
+
+# Joins the paths on stdin, one per line, into one regex alternation, each
+# matched literally
+regex_of() {
+  sed 's/[][\.*^$+?(){}|]/\\&/g' | paste -sd '|' -
 }
 
 # True for the private folder, where reading a project token would let the

@@ -12,6 +12,13 @@
 ; The project's own policy only changes by the user's hand. An edit would just
 ; need approving again, but this keeps the agent from asking for it.
 (deny file-write* (literal (param "PROJECT_POLICY")))
+; Claude Code's settings, its plugins folder and the shell profiles it starts
+; from can turn the hooks or lockdown off, so commands can't change those
+; either. Any project's settings count, wherever the project is.
+(deny file-write* (regex (param "CLAUDE_SETTINGS")) (regex #"/\.claude/settings(\.local)?\.json$"))
+; Nor rename or remove a folder above anything protected here, which would
+; take it away along with the folder
+(deny file-write* (regex (param "PARENT_DIRS")))
 ; Outbound traffic may only reach loopback, where the Blindfold proxy and any
 ; local dev servers listen. Everything else has to go through the proxy.
 (deny network-outbound)
