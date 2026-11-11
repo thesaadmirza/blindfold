@@ -24,25 +24,13 @@ func main() {
 	portFile := flag.String("port-file", "", "write the chosen port to this file (mode 600)")
 	logPath := flag.String("log", "", "append one JSON line per connection to this file")
 	policyPath := flag.String("policy", "", "policy file saying where each secret may go")
+	stateFile := flag.String("state", "", "write the loaded policy's secret names, or its error, to this file")
 	bundlePath := flag.String("ca-bundle", "", "write the system roots plus the local CA to this file")
 	systemRoots := flag.String("system-roots", "/etc/ssl/cert.pem", "PEM file with the roots clients normally trust")
 	keychain := flag.String("keychain", "", "keychain to read secrets from (default: the login keychain)")
 	service := flag.String("service", "claude-secrets", "keychain service secrets are stored under")
 	accountPrefix := flag.String("account-prefix", "claude-secret:global:", "prefix of a secret's keychain account")
-	printSecrets := flag.Bool("print-secrets", false, "check the policy, print the secret names it covers and exit")
 	flag.Parse()
-
-	if *printSecrets {
-		pol, err := LoadPolicy(*policyPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		for _, name := range pol.Names() {
-			fmt.Println(name)
-		}
-		return
-	}
 
 	ln, err := listenLoopback(*listen)
 	if err != nil {
@@ -53,8 +41,8 @@ func main() {
 		log.Fatal(err)
 	}
 	proxy := NewProxy(record, keychainLookup(*keychain, *service, *accountPrefix))
-	w := &policyWatcher{proxy: proxy, path: *policyPath, bundle: *bundlePath, roots: *systemRoots}
-	// The bundle has to exist before the port file says the proxy is up
+	w := &policyWatcher{proxy: proxy, path: *policyPath, state: *stateFile, bundle: *bundlePath, roots: *systemRoots}
+	// The state and bundle have to exist before the port file says the proxy is up
 	if err := w.reload(); err != nil {
 		log.Fatal(err)
 	}
@@ -74,19 +62,20 @@ func main() {
 	log.Fatal(srv.Serve(ln))
 }
 
-// policyWatcher reloads the policy when its file changes and rewrites the CA
-// bundle when that changes the CA
+// policyWatcher reloads the policy when its file changes, and stops the proxy
+// when its own binary is rebuilt so the guard starts the new one
 type policyWatcher struct {
 	proxy  *Proxy
 	path   string
+	state  string
 	bundle string
 	roots  string
-	seen   string // size and mtime of the file at the last load
-	ca     *authority
+	seen   string // stamp of the policy file at the last load
 }
 
-func (w *policyWatcher) stamp() string {
-	info, err := os.Stat(w.path)
+// stamp changes whenever a file is written, replaced or removed
+func stamp(path string) string {
+	info, err := os.Stat(path)
 	if err != nil {
 		return "missing"
 	}
@@ -94,8 +83,13 @@ func (w *policyWatcher) stamp() string {
 }
 
 func (w *policyWatcher) watch(every time.Duration) {
+	self, _ := os.Executable()
+	built := stamp(self)
 	for range time.Tick(every) {
-		if w.stamp() != w.seen {
+		if self != "" && stamp(self) != built {
+			os.Exit(0)
+		}
+		if stamp(w.path) != w.seen {
 			if err := w.reload(); err != nil {
 				log.Print(err)
 			}
@@ -103,25 +97,38 @@ func (w *policyWatcher) watch(every time.Duration) {
 	}
 }
 
-// reload applies the policy file. A policy that doesn't load turns injection
-// off until it's fixed, rather than keeping rules the user meant to change.
+// reload applies the policy file and writes what it loaded to the state file,
+// which the guard reads, so the guard and the proxy never disagree about the
+// policy. A policy that doesn't load turns injection off until it's fixed,
+// rather than keeping rules the user meant to change. The error returned is
+// only for files the proxy couldn't write.
 func (w *policyWatcher) reload() error {
-	w.seen = w.stamp()
+	w.seen = stamp(w.path)
 	pol, loadErr := LoadPolicy(w.path)
 	if loadErr != nil {
+		log.Print(loadErr)
 		pol = &Policy{}
 	}
 	ca, err := w.proxy.SetPolicy(pol)
 	if err != nil {
 		return err
 	}
-	if w.bundle != "" && (ca != w.ca || ca == nil) {
+	if w.bundle != "" {
 		if err := writeBundle(w.bundle, w.roots, ca); err != nil {
 			return err
 		}
 	}
-	w.ca = ca
-	return loadErr
+	if w.state == "" {
+		return nil
+	}
+	state := "ok\n"
+	if loadErr != nil {
+		state = "error\n" + loadErr.Error() + "\n"
+	}
+	for _, name := range pol.Names() {
+		state += name + "\n"
+	}
+	return writeFileAtomic(w.state, []byte(state))
 }
 
 // writeBundle writes the usual roots plus the local CA, for SSL_CERT_FILE and

@@ -21,6 +21,8 @@ CONFIG_DIR="${BLINDFOLD_CONFIG_DIR:-$HOME/.config/blindfold}"
 POLICY_FILE="${BLINDFOLD_POLICY:-${CONFIG_DIR}/policy.toml}"
 PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-${CONFIG_DIR}/run/proxy.port}"
 CA_BUNDLE="${PROXY_PORT_FILE%/*}/ca-bundle.pem"
+# What the running proxy loaded: "ok" or "error", then the secret names
+POLICY_STATE="${PROXY_PORT_FILE%/*}/policy.state"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
@@ -67,30 +69,28 @@ egress_enabled() {
   [[ "$BLINDFOLD_EGRESS" == "proxy" && "$OSTYPE" == darwin* ]]
 }
 
-# Sets PROXY_PORT to a running proxy, starting one first if needed. A running
-# proxy is reused only if it wrote its CA bundle and the binary hasn't been
-# rebuilt since it started, so an upgrade never leaves an old proxy serving.
-# The wait is capped at 2s so a slow start fails cleanly inside the hook's 5s
-# timeout.
+# Sets PROXY_PORT to a running proxy, starting one first if needed. The proxy
+# exits by itself when its binary is rebuilt, so a dead port means "start it".
+# A proxy without a state file predates policies and is replaced too. The wait
+# is capped at 2s so a slow start fails cleanly inside the hook's 5s timeout.
 ensure_proxy() {
-  local i pid_file="${PROXY_PORT_FILE%.port}.pid" old_pid=""
+  local i
   PROXY_PORT=""
   read -r PROXY_PORT <"$PROXY_PORT_FILE" 2>/dev/null
-  if [[ -n "$PROXY_PORT" && -f "$CA_BUNDLE" && ! "$PROXY_BIN" -nt "$PROXY_PORT_FILE" ]] &&
+  if [[ -n "$PROXY_PORT" && -f "$POLICY_STATE" ]] &&
     { true <>"/dev/tcp/127.0.0.1/${PROXY_PORT}"; } 2>/dev/null; then
     return 0
   fi
   [[ -x "$PROXY_BIN" ]] || return 1
 
-  read -r old_pid <"$pid_file" 2>/dev/null
-  [[ "$old_pid" =~ ^[0-9]+$ ]] && kill "$old_pid" 2>/dev/null
   mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
-  rm -f "$PROXY_PORT_FILE"
-  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE" --ca-bundle "$CA_BUNDLE"
-    --service "$SERVICE" --account-prefix "$(make_account_key global '')")
+  rm -f "$PROXY_PORT_FILE" "$POLICY_STATE"
+  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE"
+    --state "$POLICY_STATE" --ca-bundle "$CA_BUNDLE" --service "$SERVICE"
+    --account-prefix "$(make_account_key global '')")
   [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
   nohup "$PROXY_BIN" "${args[@]}" </dev/null >/dev/null 2>&1 &
-  echo "$!" >"$pid_file"
+  echo "$!" >"${PROXY_PORT_FILE%.port}.pid"
   for ((i = 0; i < 100; i++)); do
     if [[ -s "$PROXY_PORT_FILE" ]]; then
       read -r PROXY_PORT <"$PROXY_PORT_FILE"
@@ -110,29 +110,34 @@ build_sandbox_argv() {
   [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
 
   if egress_enabled; then
-    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" names name var
-    [[ -f "$profile" && -x "$PROXY_BIN" ]] || return 1
-    if ! names=$("$PROXY_BIN" -print-secrets -policy "$POLICY_FILE" 2>&1); then
-      EGRESS_SETUP_ERROR="The Blindfold policy is not valid. ${names}"
+    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" status="" detail="" name var names=()
+    [[ -f "$profile" ]] && ensure_proxy || return 1
+    # Read the policy as the proxy loaded it, so the two never disagree
+    {
+      read -r status
+      [[ "$status" == error ]] && read -r detail
+      while IFS= read -r name; do names+=("$name"); done
+    } <"$POLICY_STATE"
+    if [[ "$status" == error ]]; then
+      EGRESS_SETUP_ERROR="The Blindfold policy is not valid. ${detail}"
       EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent."
       return 1
     fi
-    ensure_proxy || return 1
 
     local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
     SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
       "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts")
-    if [[ -n "$names" ]]; then
+    if [[ ${#names[@]} -gt 0 ]]; then
       # Trust the local CA, inside the sandbox only, so the proxy can open
-      # TLS to policy hosts
+      # TLS to policy hosts. proxy/policy.go reserves these names.
       for var in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO PIP_CERT; do
         SANDBOX_ARGV+=("${var}=${CA_BUNDLE}")
       done
       # Tools that read their token from the environment send the
       # placeholder, and the proxy fills it in for the right host
-      while IFS= read -r name; do
+      for name in "${names[@]}"; do
         SANDBOX_ARGV+=("${name}={{${name}}}")
-      done <<<"$names"
+      done
     fi
     protected_dirs
     SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
