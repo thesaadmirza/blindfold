@@ -28,6 +28,28 @@ type Rule struct {
 	Header    string     `toml:"header"`
 	BasicAuth *BasicAuth `toml:"basic_auth"`
 	Query     string     `toml:"query"`
+	// Approve is when to ask a person before the value goes out: "never"
+	// (the default), "writes" (any method but GET and HEAD) or "always"
+	Approve string `toml:"approve"`
+}
+
+// Values for Rule.Approve
+const (
+	approveNever  = "never"
+	approveWrites = "writes"
+	approveAlways = "always"
+)
+
+// NeedsApproval reports whether a request with this method has to be
+// approved before the secret goes into it
+func (r *Rule) NeedsApproval(method string) bool {
+	switch r.Approve {
+	case approveAlways:
+		return true
+	case approveWrites:
+		return method != http.MethodGet && method != http.MethodHead
+	}
+	return false
 }
 
 type BasicAuth struct {
@@ -143,6 +165,13 @@ func (r *Rule) validate() error {
 	}
 	if slots != 1 {
 		return errors.New("set exactly one of header, basic_auth and query")
+	}
+	switch r.Approve {
+	case "":
+		r.Approve = approveNever
+	case approveNever, approveWrites, approveAlways:
+	default:
+		return fmt.Errorf("approve %q: use never, writes or always", r.Approve)
 	}
 	return nil
 }

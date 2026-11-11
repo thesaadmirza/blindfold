@@ -83,6 +83,7 @@ func TestRejectsUnsafePolicies(t *testing.T) {
 		"loader variable":  `[secrets.DYLD_INSERT_LIBRARIES]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "X"`,
 		"bad name":         `[secrets."A-B"]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "X"`,
 		"typo in a key":    `[secrets.A]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `hedaer = "X"`,
+		"unknown approve":  `[secrets.A]` + "\n" + `hosts = ["gitlab.com"]` + "\n" + `header = "X"` + "\n" + `approve = "sometimes"`,
 		"not toml":         `this is not toml`,
 	}
 	for name, body := range cases {
@@ -101,5 +102,34 @@ func TestErrorsNameTheFile(t *testing.T) {
 
 	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "secrets.A") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestApproveSetting(t *testing.T) {
+	cases := []struct {
+		approve, method string
+		ask             bool
+	}{
+		{"", "POST", false},
+		{"never", "DELETE", false},
+		{"writes", "GET", false},
+		{"writes", "HEAD", false},
+		{"writes", "POST", true},
+		{"writes", "PATCH", true},
+		{"writes", "OPTIONS", true},
+		{"always", "GET", true},
+	}
+	for _, c := range cases {
+		body := "[secrets.A]\nhosts = [\"gitlab.com\"]\nheader = \"X\"\n"
+		if c.approve != "" {
+			body += "approve = \"" + c.approve + "\"\n"
+		}
+		p, err := LoadPolicy(writePolicy(t, body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.Secrets["A"].NeedsApproval(c.method); got != c.ask {
+			t.Errorf("approve=%q %s: asks = %v", c.approve, c.method, got)
+		}
 	}
 }
