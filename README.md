@@ -63,11 +63,11 @@ Secrets can be global (shared across projects) or project-scoped (tied to a spec
 
 On macOS, a PreToolUse hook wraps every bash command in a Seatbelt sandbox before execution. The sandbox blocks `com.apple.SecurityServer` at the kernel level, which cuts off all keychain access from any process inside it. Python subprocesses, base64-decoded scripts, temp file execution, doesn't matter. The block is below the shell.
 
-There are two ways a value leaves the keychain. `secret-exec.sh` runs outside the sandbox, reads the value, passes it to the command in a prefixed variable (`__SV_NAME`), runs the command inside the sandbox and redacts the output. Under egress lockdown, the proxy reads it instead, and only to put it into a request to a host its policy names. With lockdown on, `secret-exec.sh` refuses any secret that has a policy, so for those the proxy is the only way. While you migrate, set `BLINDFOLD_EXEC_ANY_SECRET=1` for Claude Code to turn that refusal off. A command that sets it in front of the script loses its exemption and runs in the sandbox, away from the keychain. But it's a setting, not a lock: an agent that can edit Claude Code's settings can set it, or switch lockdown off. [SECURITY.md](SECURITY.md) covers that.
+There are two ways a value leaves the keychain. `secret-exec.sh` runs outside the sandbox, reads the value, passes it to the command in a prefixed variable (`__SV_NAME`), runs the command inside the sandbox and redacts the output. Under egress lockdown, the proxy reads it instead, and only to put it into a request to a host its policy names. With lockdown on, `secret-exec.sh` refuses any secret that has a policy, so for those the proxy is the only way. While you migrate, add `BLINDFOLD_EXEC_ANY_SECRET=1` to `~/.config/blindfold/settings` to turn that refusal off. Blindfold only reads it from that file, which the agent can't write under lockdown, so setting it in a command or in Claude Code's environment does nothing.
 
 Storing a secret goes through a native OS dialog. The value goes from your keyboard to the keychain. Claude sees "OK: stored."
 
-The same hook also covers Claude's file tools. Read is refused for a file that holds a stored value, so a value a command wrote to disk can't be read back. Write and Edit are refused for Blindfold's own scripts and config and for any `.blindfold.toml`, so the agent can't change where secrets may go.
+The same hook also covers Claude's file tools. Read is refused for a file that holds a stored value, so a value a command wrote to disk can't be read back. Write and Edit are refused for Blindfold's own scripts and config and for any `.blindfold.toml`, so the agent can't change where secrets may go. Under lockdown, Write and Edit are also refused for Claude Code's settings files (`~/.claude/settings.json` and `settings.local.json`, and any project's `.claude/settings.json` and `.claude/settings.local.json`), for `~/.claude/plugins/`, and for your shell profiles. That's where Blindfold's hooks and lockdown get switched on, so an agent that could edit them could switch Blindfold off for the next session.
 
 [SECURITY.md](SECURITY.md) has the full threat model, including what Blindfold doesn't protect against.
 
@@ -83,11 +83,17 @@ To try it, build the proxy (needs Go 1.24+):
 bash ~/.claude/skills/blindfold/scripts/build-proxy.sh
 ```
 
-Then set `BLINDFOLD_EGRESS=proxy` for Claude Code, for example in the `env` block of `~/.claude/settings.json`. The guard starts the proxy on first use, and restarts it after you rebuild it. If the proxy can't start, commands are refused rather than run without the lockdown.
+Then turn it on in Blindfold's settings file:
+
+```bash
+mkdir -p ~/.config/blindfold && echo BLINDFOLD_EGRESS=proxy >> ~/.config/blindfold/settings
+```
+
+Setting `BLINDFOLD_EGRESS=proxy` in Claude Code's environment works too, but the file is the better place. The agent can't write it under lockdown, and no `BLINDFOLD_EGRESS` value in the environment can turn off what it turned on. The file takes one `NAME=value` per line. If Blindfold finds a line it doesn't know, it refuses commands until you fix it rather than guess. The guard starts the proxy on first use, and restarts it after you rebuild it. If the proxy can't start, commands are refused rather than run without the lockdown.
 
 macOS won't apply this profile inside another sandbox. If Claude Code's own sandbox is on, commands under egress lockdown fail to start.
 
-Under lockdown, sandboxed commands can't write to `~/.config/blindfold/` or to Blindfold's own folder, and the guard stops Claude's Write and Edit tools from changing them too.
+Under lockdown, sandboxed commands can't write to `~/.config/blindfold/`, Blindfold's own folder, Claude Code's settings files, `~/.claude/plugins/` or your shell profiles, and they can't rename or remove a folder that holds any of those. The guard stops Claude's Write and Edit tools from changing them too. The catch is that Claude can't edit its own settings while lockdown is on. It'll tell you what to change, and you make the edit.
 
 ### Binding a secret to its host
 
