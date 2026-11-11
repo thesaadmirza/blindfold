@@ -8,7 +8,6 @@ import os
 
 import pytest
 
-
 from conftest import (
     SCRIPTS_DIR,
     build_file_tool_input,
@@ -214,6 +213,13 @@ class TestBlindfoldFilesAreProtected:
         os.link(self.config / "policy.toml", alias)
 
         assert self._edit(alias, "Edit").returncode == 2
+
+    def test_hard_linked_file_elsewhere_is_allowed(self):
+        # pnpm and similar tools hard-link files; only links into Blindfold count
+        (self.dir / "store.js").write_text("")
+        os.link(self.dir / "store.js", self.dir / "linked.js")
+
+        assert self._edit(self.dir / "linked.js", "Edit").returncode == 0
 
     @pytest.mark.parametrize("name", ["notes.md", "sub/new.py"])
     def test_ordinary_files_are_allowed(self, name):

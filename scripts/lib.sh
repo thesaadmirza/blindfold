@@ -27,6 +27,7 @@ EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
 _SV_PLATFORM=""
+PROTECTED_DIRS=()
 
 # Returns the keychain path arg for security commands, or empty if using login keychain.
 _keychain_arg() {
@@ -133,54 +134,57 @@ build_sandbox_argv() {
         SANDBOX_ARGV+=("${name}={{${name}}}")
       done <<<"$names"
     fi
-    SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=$(real_dir "$CONFIG_DIR")" -D "INSTALL_DIR=$(real_dir "$INSTALL_DIR")"
+    protected_dirs
+    SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
       -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
   fi
 }
 
-# Prints the real path of a directory, creating it first, since Seatbelt
-# matches resolved paths and the profile needs one that exists
-real_dir() {
-  mkdir -p "$1" 2>/dev/null
-  (cd "$1" 2>/dev/null && pwd -P)
+# Sets PROTECTED_DIRS to the real paths of CONFIG_DIR and INSTALL_DIR, once
+# per run. They're created first, since Seatbelt matches resolved paths and
+# the profile needs ones that exist.
+protected_dirs() {
+  [[ ${#PROTECTED_DIRS[@]} -gt 0 ]] && return 0
+  local d
+  for d in "$CONFIG_DIR" "$INSTALL_DIR"; do
+    [[ -d "$d" ]] || mkdir -p "$d" 2>/dev/null
+    PROTECTED_DIRS+=("$(cd "$d" 2>/dev/null && pwd -P)")
+  done
 }
 
 # True when path, once symlinks and .. are resolved, is inside CONFIG_DIR or
 # INSTALL_DIR. The agent's file tools go through this, since they run outside
 # the sandbox.
 is_protected_path() {
-  local path="$1" rest="" dir hops
+  local path="$1" rest="" dir target hops links inode real protected
+  protected_dirs
   # Follow a symlink at the end, a few hops at most
   for ((hops = 0; hops < 8; hops++)); do
     [[ -L "$path" ]] || break
-    local target
     target=$(readlink "$path")
-    [[ "$target" == /* ]] && path="$target" || path="$(dirname "$path")/${target}"
+    [[ "$target" == /* ]] && path="$target" || path="${path%/*}/${target}"
   done
   # Resolve the deepest part that exists. A .. in the part that doesn't exist
   # yet can't be resolved here, so treat it as protected rather than guess.
   dir="$path"
   while [[ -n "$dir" && ! -d "$dir" ]]; do
-    rest="/$(basename "$dir")${rest}"
-    dir=$(dirname "$dir")
+    rest="/${dir##*/}${rest}"
+    [[ "$dir" == */* ]] && dir="${dir%/*}" || dir="."
   done
   [[ "$rest" == */../* || "$rest" == */.. ]] && return 0
-  # A hard link made from inside the sandbox would let a file tool write a
-  # protected file under another name, so refuse files with more than one
-  if [[ -f "$path" ]]; then
-    local links
-    links=$(stat -f %l "$path" 2>/dev/null || stat -c %h "$path" 2>/dev/null)
-    [[ "${links:-1}" -gt 1 ]] && return 0
-  fi
-  local real
-  real="$(cd "$dir" 2>/dev/null && pwd -P)${rest}"
-  local protected
-  for protected in "$(real_dir "$CONFIG_DIR")" "$(real_dir "$INSTALL_DIR")"; do
+  real="$(cd "${dir:-/}" 2>/dev/null && pwd -P)${rest}"
+  for protected in "${PROTECTED_DIRS[@]}"; do
     [[ "$real" == "$protected" || "$real" == "$protected"/* ]] && return 0
   done
-  return 1
+  # A hard link made inside the sandbox could give a protected file a second
+  # name. Only multiply-linked files need the (slower) inode search.
+  [[ -f "$path" ]] || return 1
+  links=$(stat -f %l "$path" 2>/dev/null || stat -c %h "$path" 2>/dev/null)
+  [[ "${links:-1}" -gt 1 ]] || return 1
+  inode=$(stat -f %i "$path" 2>/dev/null || stat -c %i "$path" 2>/dev/null)
+  [[ -n "$(find "${PROTECTED_DIRS[@]}" -xdev -inum "$inode" -print -quit 2>/dev/null)" ]]
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
