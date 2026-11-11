@@ -128,7 +128,7 @@ What you approve is an exact copy. Change one byte and it needs approving again.
 
 A project policy can't change the rule for a secret the global policy already names, so an approved project can't send your global token somewhere new. For its own secrets, the project's stored value is used first (`secret-store.sh --scope project`), then the global one.
 
-Projects are kept apart by a secret token per project, which the guard puts in the proxy URL as a password. The tokens live in `~/.config/blindfold/private/`, which sandboxed commands can't read and Claude's file tools are kept out of, so a command in one project can't pass for another.
+Projects are kept apart by a secret token for each project with a policy, which the guard puts in the proxy URL as a password. The tokens live in `~/.config/blindfold/private/`, which sandboxed commands can't read and Claude's file tools are kept out of, so a command in one project can't pass for another.
 
 Not done yet:
 
