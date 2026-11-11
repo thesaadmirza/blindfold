@@ -3,11 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 
 const (
@@ -104,51 +101,23 @@ func (a *approver) approve(req approvalRequest) (bool, string) {
 	}
 }
 
-// dialogAsk shows a native macOS dialog. Deny is the default and the cancel
-// button, so Return or Escape never allows. No answer in time, or no screen
-// to show it on, is a deny.
+// dialogAsk asks in a native dialog. No answer in time, or no screen to show
+// it on, is a deny.
 func dialogAsk(req approvalRequest) answer {
 	msg := fmt.Sprintf("An agent wants to use %s.\n\nRequest: %s https://%s\nRequest path: %s",
-		req.Secret, req.Method, req.Host, shownText(req.Path))
+		req.Secret, req.Method, req.Host, oneLine(req.Path, 120))
 	if req.Project != "" {
 		msg += "\nProject: " + req.Project
 	}
 	msg += "\n\n\"Allow 30 min\" covers this secret, method and host for 30 minutes."
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialogTimeout+5*time.Second)
-	defer cancel()
-	script := fmt.Sprintf(`display dialog (item 1 of argv) with title "Blindfold" buttons {"Deny", "Allow once", "Allow 30 min"} default button "Deny" cancel button "Deny" giving up after %d with icon caution`, int(dialogTimeout.Seconds()))
-	out, _ := exec.CommandContext(ctx, "osascript", "-e", "on run argv", "-e", script, "-e", "end run", msg).CombinedOutput()
-	return parseDialogReply(string(out))
-}
-
-func parseDialogReply(reply string) answer {
-	if !strings.Contains(reply, "gave up:false") {
-		return deny
-	}
-	switch {
-	case strings.Contains(reply, "button returned:Allow 30 min"):
-		return allowForAWhile
-	case strings.Contains(reply, "button returned:Allow once"):
+	switch showDialog(context.Background(), msg, []string{"Deny", "Allow once", "Allow 30 min"}, dialogTimeout) {
+	case "Allow once":
 		return allowOnce
+	case "Allow 30 min":
+		return allowForAWhile
 	}
 	return deny
-}
-
-// shownText makes text the agent controls safe to put in a dialog: control
-// characters become "?", and it's cut to a length that can't push the
-// buttons' meaning off screen
-func shownText(s string) string {
-	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return '?'
-		}
-		return r
-	}, s)
-	if r := []rune(s); len(r) > 120 {
-		s = string(r[:120]) + "..."
-	}
-	return s
 }
 
 // waitersFor reports how many requests are waiting on a dialog for req

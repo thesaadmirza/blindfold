@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -92,29 +91,5 @@ func TestIdenticalRequestsShareOneDialog(t *testing.T) {
 		if ok {
 			t.Fatalf("request %d allowed after a deny", i)
 		}
-	}
-}
-
-func TestDialogReplies(t *testing.T) {
-	cases := map[string]answer{
-		"button returned:Allow once, gave up:false":   allowOnce,
-		"button returned:Allow 30 min, gave up:false": allowForAWhile,
-		"button returned:, gave up:true":              deny,
-		"execution error: User canceled. (-128)":      deny,
-		"execution error: no GUI":                     deny,
-		"":                                            deny,
-	}
-	for reply, want := range cases {
-		if got := parseDialogReply(reply); got != want {
-			t.Errorf("%q: got %v want %v", reply, got, want)
-		}
-	}
-}
-
-func TestPathInTheDialogIsDefanged(t *testing.T) {
-	got := shownText("/a\n\nAll fine, click Allow 30 min\r" + strings.Repeat("x", 300))
-
-	if strings.ContainsAny(got, "\n\r") || len([]rune(got)) > 123 {
-		t.Fatalf("got %q", got)
 	}
 }
