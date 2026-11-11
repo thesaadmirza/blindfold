@@ -130,9 +130,20 @@ A project policy can't change the rule for a secret the global policy already na
 
 Projects are kept apart by a secret token for each project with a policy, which the guard puts in the proxy URL as a password. The tokens live in `~/.config/blindfold/private/`, which sandboxed commands can't read and Claude's file tools are kept out of, so a command in one project can't pass for another.
 
+### What comes back, and what gets recorded
+
+Responses from a policy host are checked on the way back. Any copy of a secret's value, in a header or the body, is swapped for its placeholder before the command sees it. That covers APIs that echo a token, and ones that store a token and return it on some later call. To read the body, the proxy asks for an uncompressed response, and if a server sends gzip anyway it unpacks it. A response in an encoding the proxy can't read, like brotli, is refused rather than passed through unchecked.
+
+Every use of a secret goes in `~/.local/state/blindfold/audit.jsonl`, one line each:
+
+```json
+{"ts":"2026-11-11T14:02:09Z","decision":"filled","secret":"GITLAB_TOKEN","method":"POST","host":"gitlab.com","path":"/api/v4/projects/42/issues","status":201}
+```
+
+The decisions are `filled`, `echoed` (the response held the value and it was scrubbed), and the refusals: `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `outside-slot` (a placeholder sent in a header or parameter its rule doesn't name) and `plain-http`. Query strings are never logged. If something looks off, read the refusals first. Most will be a tool misconfigured, but a refusal is also what it looks like when something tries to send a secret where it isn't allowed.
+
 Not done yet:
 
-- Scrubbing a value from responses that echo it back, and a full audit log. The egress log already names the secrets used for each request.
 - Approval prompts for writes.
 - `secret-exec.sh` still puts real values into commands. Use the placeholder pattern above for HTTP APIs.
 
@@ -143,6 +154,8 @@ Known limits:
 - Tools that pin certificates won't accept the local CA.
 - A project's token is in the environment of the commands that run there, so another process of yours that can read process environments could see it. Inside the sandbox that would let a command pass for a project it's running next to.
 - Without lockdown, Bash commands aren't kept out of Blindfold's config. Turn lockdown on before relying on any policy.
+- Scrubbing catches the value as it was stored. A response holding it transformed, say base64-encoded, gets through, though an API doing that would be odd.
+- A placeholder in a request body isn't looked for, so `outside-slot` only covers headers and the URL. It's never filled in either way.
 - An allowed host can still be misused. The proxy keeps a secret from going anywhere else, but it won't stop an unwanted call to the right host. Narrowly scoped tokens help.
 
 ## Files

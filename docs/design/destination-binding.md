@@ -1,6 +1,6 @@
 # Design: binding secrets to their destinations
 
-Status: draft, 2026-11-10, updated 2026-11-11. Milestones 1 and 2 are built.
+Status: draft, 2026-11-10, updated 2026-11-11. Milestones 1 to 3 are built.
 
 ## The problem
 
@@ -102,7 +102,7 @@ A secret with no policy can't go through the proxy at all. It can only be used t
    - If no policy names that host, the proxy opens a plain tunnel and never looks inside. Ordinary traffic like `npm install` works as before. Nothing sensitive can leak this way, because a placeholder is worthless to anyone except the proxy.
    - If a policy names the host, the proxy terminates TLS with a certificate for that host, signed by the local CA.
 4. For each request inside that connection, the proxy checks four things: the CONNECT host matches the policy, the `Host` header matches the CONNECT host, the method is allowed, and approval has been given if needed. Then it replaces the placeholder in the named header and forwards the request to the real host. It verifies the real host's certificate normally.
-5. On the way back, the proxy replaces any copy of the value in the response headers and body with the placeholder. That covers APIs that echo the token back. To make this possible, it strips `Accept-Encoding` from requests it injects into, so responses come back uncompressed.
+5. On the way back, the proxy replaces any copy of the value in the response headers and body with the placeholder. That covers APIs that echo the token back. It does this for every response from a policy host, not only ones it filled something into, since an API can store a token and return it on a later call. To make this possible, it strips `Accept-Encoding` from requests to policy hosts. The proxy's HTTP client then asks for gzip itself and unpacks it, and a response in any other encoding is refused.
 6. Redirects aren't followed with the secret attached. If the client follows a redirect to another host, that's a new request, and the policy is checked again from scratch.
 7. One JSON line is written to the audit log.
 
@@ -133,7 +133,7 @@ Each line in `~/.local/state/blindfold/audit.jsonl` looks like this:
 {"ts":"2026-11-10T16:40:02Z","secret":"GITLAB_TOKEN","session":"<hook session_id>","method":"POST","host":"gitlab.com","path":"/api/v4/projects/42/issues","status":201,"decision":"approved-session"}
 ```
 
-Query strings are left out of `path`, because they can carry data. Denied attempts are logged too: wrong host, wrong method, no policy, approval refused. Those are the lines someone investigating an incident will want most. Hash-chaining the log can come later.
+Query strings are left out of `path`, because they can carry data. Denied attempts are logged too. Those are the lines someone investigating an incident will want most. As built, the decisions are `filled`, `echoed`, `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `outside-slot` and `plain-http`, and a line names the project when a project's secret was used. The session id isn't logged, since the proxy doesn't see it. Wrong-method and approval decisions arrive with milestone 4. Hash-chaining the log can come later.
 
 ## What stays the same
 

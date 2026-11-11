@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -95,7 +96,8 @@ type harness struct {
 	attacker *fakeServer
 	plain    *fakeServer
 	lookups  []string
-	scopes   []string
+	scopeOf  map[string]string // secret name -> scope it was last looked up in
+	audits   []AuditEntry
 	roots    *x509.CertPool
 	mu       sync.Mutex
 	client   *http.Client
@@ -106,7 +108,7 @@ type harness struct {
 // HTTP. The proxy's dialer sends each host name to the matching server.
 func newHarness(t *testing.T, allowedHandler http.HandlerFunc) *harness {
 	t.Helper()
-	h := &harness{t: t, entries: make(chan Entry, 32)}
+	h := &harness{t: t, entries: make(chan Entry, 32), scopeOf: map[string]string{}}
 
 	// Real-looking certificates for the fake servers, from a separate CA
 	// standing in for the public web PKI
@@ -137,7 +139,7 @@ func newHarness(t *testing.T, allowedHandler http.HandlerFunc) *harness {
 	lookup := func(scope, name string) (string, error) {
 		h.mu.Lock()
 		h.lookups = append(h.lookups, name)
-		h.scopes = append(h.scopes, scope)
+		h.scopeOf[name] = scope
 		h.mu.Unlock()
 		if v, ok := testValues[scope+":"+name]; ok {
 			return v, nil
@@ -148,6 +150,11 @@ func newHarness(t *testing.T, allowedHandler http.HandlerFunc) *harness {
 		return "", errors.New("not in the keychain")
 	}
 	h.proxy = NewProxy(func(e Entry) { h.entries <- e }, lookup)
+	h.proxy.audit = func(e AuditEntry) {
+		h.mu.Lock()
+		h.audits = append(h.audits, e)
+		h.mu.Unlock()
+	}
 	routes := map[string]string{
 		allowedHost + ":443":  h.allowed.addr,
 		attackerHost + ":443": h.attacker.addr,
@@ -195,18 +202,21 @@ func (h *harness) clientFor(token string) *http.Client {
 
 func (h *harness) do(req *http.Request) *http.Response {
 	h.t.Helper()
-	return h.send(h.client, req)
+	resp, _ := h.send(h.client, req)
+	return resp
 }
 
-func (h *harness) send(c *http.Client, req *http.Request) *http.Response {
+// send makes the request with client c and returns the response, with its
+// body already read into the string
+func (h *harness) send(c *http.Client, req *http.Request) (*http.Response, string) {
 	h.t.Helper()
 	resp, err := c.Do(req)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	return resp
+	return resp, string(body)
 }
 
 func newRequest(t *testing.T, method, rawURL, body string) *http.Request {
@@ -385,6 +395,9 @@ func TestMissingValueFailsTheRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusBadGateway || len(h.allowed.requests()) != 0 {
 		t.Fatalf("status = %d, forwarded = %d", resp.StatusCode, len(h.allowed.requests()))
 	}
+	if got := h.audited(auditMissing); len(got) != 1 || got[0].Secret != "UNSTORED" {
+		t.Fatalf("refused-missing = %+v", got)
+	}
 }
 
 func TestRequestWithoutPlaceholdersIsForwardedUnchanged(t *testing.T) {
@@ -396,9 +409,6 @@ func TestRequestWithoutPlaceholdersIsForwardedUnchanged(t *testing.T) {
 
 	if got := h.only(h.allowed); got.Header.Get("Private-Token") != "already-a-real-token" {
 		t.Fatalf("header = %q", got.Header.Get("Private-Token"))
-	}
-	if len(h.lookups) != 0 {
-		t.Fatalf("proxy read %v with nothing to fill", h.lookups)
 	}
 }
 
@@ -473,8 +483,8 @@ func TestProjectTokenAddsTheProjectsRules(t *testing.T) {
 	if got := h.only(h.allowed).Header.Get("X-Project-Key"); got != projectValue {
 		t.Fatalf("X-Project-Key = %q", got)
 	}
-	if !slices.Equal(h.scopes, []string{projectA}) {
-		t.Fatalf("looked up in scopes %v", h.scopes)
+	if scope := h.scopeOf["PROJECT_KEY"]; scope != projectA {
+		t.Fatalf("PROJECT_KEY looked up in scope %q", scope)
 	}
 }
 
@@ -518,7 +528,121 @@ func TestGlobalSecretsAreLookedUpGlobally(t *testing.T) {
 
 	h.send(h.clientFor(tokenA), req)
 
-	if !slices.Equal(h.scopes, []string{""}) {
-		t.Fatalf("looked up in scopes %q", h.scopes)
+	if scope, ok := h.scopeOf["GITLAB_TOKEN"]; !ok || scope != "" {
+		t.Fatalf("GITLAB_TOKEN looked up in scope %q", scope)
+	}
+}
+
+// audited returns the audit entries with the given decision
+func (h *harness) audited(decision string) []AuditEntry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []AuditEntry
+	for _, e := range h.audits {
+		if e.Decision == decision {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestEchoedValueIsScrubbed(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("Private-Token")
+		w.Header().Set("X-Echo", token)
+		io.WriteString(w, `{"you_sent":"`+token+`"}`)
+	})
+	req := newRequest(t, "GET", "https://"+allowedHost+"/echo?x=1", "")
+	req.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
+
+	resp, body := h.send(h.client, req)
+
+	if body != `{"you_sent":"{{GITLAB_TOKEN}}"}` || resp.Header.Get("X-Echo") != "{{GITLAB_TOKEN}}" {
+		t.Fatalf("value came back: header %q body %q", resp.Header.Get("X-Echo"), body)
+	}
+	if got := h.audited(auditFilled); len(got) != 1 || got[0].Secret != "GITLAB_TOKEN" || got[0].Path != "/echo" || got[0].Status != 200 {
+		t.Fatalf("filled = %+v", got)
+	}
+	if got := h.audited(auditEchoed); len(got) != 1 || got[0].Detail != "2 copies" {
+		t.Fatalf("echoed = %+v", got)
+	}
+}
+
+// An API can keep a token and hand it back on a call that never sent it
+func TestStoredValueReturnedLaterIsScrubbed(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "webhook secret: "+tokenValue)
+	})
+
+	_, body := h.send(h.client, newRequest(t, "GET", "https://"+allowedHost+"/hooks/1", ""))
+
+	if strings.Contains(body, tokenValue) || !strings.Contains(body, "{{GITLAB_TOKEN}}") {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestGzippedResponseIsScrubbed(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			io.WriteString(w, "not compressed: "+tokenValue)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		io.WriteString(gz, "compressed: "+tokenValue)
+		gz.Close()
+	})
+	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
+	req.Header.Set("Accept-Encoding", "gzip, br")
+
+	_, body := h.send(h.client, req)
+
+	if body != "compressed: {{GITLAB_TOKEN}}" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestResponseThatCannotBeCheckedIsRefused(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		io.WriteString(w, "pretend brotli: "+tokenValue)
+	})
+
+	resp, body := h.send(h.client, newRequest(t, "GET", "https://"+allowedHost+"/", ""))
+
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(body, tokenValue) {
+		t.Fatalf("status %d body %q", resp.StatusCode, body)
+	}
+	if got := h.audited(auditEncoding); len(got) != 1 || got[0].Detail != "br" {
+		t.Fatalf("audit = %+v", got)
+	}
+}
+
+func TestRefusalsAreAudited(t *testing.T) {
+	h := newHarness(t, nil)
+
+	misdirected := newRequest(t, "GET", "https://"+allowedHost+"/", "")
+	misdirected.Host = attackerHost
+	h.do(misdirected)
+	wrongUser := newRequest(t, "GET", "https://"+allowedHost+"/v2/", "")
+	wrongUser.SetBasicAuth("someone-else", "{{REGISTRY_PASSWORD}}")
+	h.do(wrongUser)
+	stray := newRequest(t, "POST", "https://"+allowedHost+"/issues?title={{GITLAB_TOKEN}}", "")
+	stray.Header.Set("X-Note", "{{GITLAB_TOKEN}}")
+	h.do(stray)
+	plain := newRequest(t, "GET", "http://"+allowedHost+"/api?key={{MAPS_KEY}}", "")
+	h.do(plain)
+
+	if got := h.audited(auditWrongHost); len(got) != 1 || got[0].Detail != "asked for "+attackerHost {
+		t.Errorf("refused-host = %+v", got)
+	}
+	if got := h.audited(auditWrongUser); len(got) != 1 || got[0].Secret != "REGISTRY_PASSWORD" {
+		t.Errorf("refused-username = %+v", got)
+	}
+	if got := h.audited(auditOutsideSlot); len(got) != 1 || got[0].Secret != "GITLAB_TOKEN" || got[0].Path != "/issues" {
+		t.Errorf("outside-slot = %+v", got)
+	}
+	if got := h.audited(auditPlainHTTP); len(got) != 1 || got[0].Secret != "MAPS_KEY" || got[0].Path != "/api" {
+		t.Errorf("plain-http = %+v", got)
 	}
 }

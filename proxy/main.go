@@ -27,6 +27,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "loopback address to listen on")
 	portFile := flag.String("port-file", "", "write the chosen port to this file (mode 600)")
 	logPath := flag.String("log", "", "append one JSON line per connection to this file")
+	auditPath := flag.String("audit", "", "append one JSON line per secret used or refused to this file")
 	policyPath := flag.String("policy", "", "policy file saying where each secret may go")
 	stateFile := flag.String("state", "", "write the loaded policy's secret names, or its error, to this file")
 	private := flag.String("private", "", "folder with project tokens and approved project policies")
@@ -57,11 +58,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	record, err := openEgressLog(*logPath)
+	record, err := openJSONL[Entry](*logPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	audit, err := openJSONL[AuditEntry](*auditPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	proxy := NewProxy(record, keychainLookup(*keychain, *service, *accountPrefix))
+	proxy.audit = audit
 	w := &policyWatcher{proxy: proxy, path: *policyPath, private: *private, state: *stateFile, bundle: *bundlePath, roots: *systemRoots}
 	// The state and bundle have to exist before the port file says the proxy is up
 	if err := w.reload(); err != nil {
@@ -231,11 +237,11 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// openEgressLog returns a recorder that appends JSON lines to path. An empty
-// path records nothing.
-func openEgressLog(path string) (func(Entry), error) {
+// openJSONL returns a recorder that appends one JSON line per value to path.
+// An empty path records nothing.
+func openJSONL[T any](path string) (func(T), error) {
 	if path == "" {
-		return func(Entry) {}, nil
+		return func(T) {}, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -246,11 +252,11 @@ func openEgressLog(path string) (func(Entry), error) {
 	}
 	var mu sync.Mutex
 	enc := json.NewEncoder(f)
-	return func(e Entry) {
+	return func(v T) {
 		mu.Lock()
 		defer mu.Unlock()
-		if err := enc.Encode(e); err != nil {
-			log.Printf("egress log: %v", err)
+		if err := enc.Encode(v); err != nil {
+			log.Printf("%s: %v", path, err)
 		}
 	}, nil
 }

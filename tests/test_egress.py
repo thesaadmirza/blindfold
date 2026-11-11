@@ -493,13 +493,15 @@ class TestEgressRuntime:
 
         assert result.stdout == "200", f"stdout={result.stdout!r} stderr={result.stderr!r}"
         _wait_for_entry(egress_env, lambda e: e["kind"] == "https" and e.get("secrets") == ["BFTEST_TOKEN"])
+        _wait_for_entry(egress_env, lambda e: e["decision"] == "filled" and e["secret"] == "BFTEST_TOKEN"
+                        and e["host"] == "example.com" and e["status"] == 200, log="audit")
 
 
 
-def _wait_for_entry(env, match):
+def _wait_for_entry(env, match, log="egress"):
     """The proxy writes a line as each request or tunnel finishes, which can be
     just after the command exits, so poll for a moment."""
-    log = Path(env["BLINDFOLD_EGRESS_LOG"])
+    log = Path(env["BLINDFOLD_EGRESS_LOG"]).with_name(f"{log}.jsonl")
     deadline = time.monotonic() + 5
     entries = []
     while time.monotonic() < deadline:

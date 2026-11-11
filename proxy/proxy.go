@@ -37,6 +37,7 @@ type Entry struct {
 // through untouched.
 type Proxy struct {
 	record    func(Entry)
+	audit     func(AuditEntry)
 	lookup    func(scope, name string) (string, error)
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
 	transport *http.Transport
@@ -70,11 +71,21 @@ func (st *policyState) rulesFor(token, host string) (map[string]*Rule, map[strin
 	return rules, scopes
 }
 
+// names returns every secret any loaded policy names
+func (st *policyState) names() []string {
+	names := st.policy.Names()
+	for _, proj := range st.projects {
+		names = append(names, proj.Policy.Names()...)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
 // NewProxy returns a proxy with an empty policy. lookup returns the stored
 // value of a secret, preferring the project scope when one is given.
 func NewProxy(record func(Entry), lookup func(scope, name string) (string, error)) *Proxy {
 	dialer := &net.Dialer{Timeout: dialTimeout}
-	p := &Proxy{record: record, lookup: lookup, dial: dialer.DialContext}
+	p := &Proxy{record: record, audit: func(AuditEntry) {}, lookup: lookup, dial: dialer.DialContext}
 	p.transport = &http.Transport{
 		// Proxy is nil, so traffic never loops back through a proxy
 		DialContext:         func(ctx context.Context, n, a string) (net.Conn, error) { return p.dial(ctx, n, a) },
@@ -187,6 +198,13 @@ func splice(client net.Conn, clientReader *bufio.Reader, upstream net.Conn) (sen
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	e := Entry{Kind: "http", Host: r.URL.Host, Method: r.Method}
+	// Plain HTTP is never filled in, but a placeholder sent this way is worth
+	// a line in the audit log
+	if st := p.state.Load(); st != nil {
+		for _, name := range placeholdersIn(r, st.names()) {
+			p.auditLog(AuditEntry{Decision: auditPlainHTTP, Secret: name, Method: r.Method, Host: r.URL.Hostname(), Path: r.URL.Path})
+		}
+	}
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	p.forwarder.ServeHTTP(rec, r)
