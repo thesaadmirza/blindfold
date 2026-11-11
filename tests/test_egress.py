@@ -121,6 +121,9 @@ class TestEgressWiring:
 
 
 def _egress_sandbox_applies() -> bool:
+    # Evaluated at collection time on every platform, so check first
+    if shutil.which("sandbox-exec") is None:
+        return False
     r = subprocess.run(["sandbox-exec", "-f", str(EGRESS_PROFILE), "/usr/bin/true"],
                        capture_output=True, text=True)
     return r.returncode == 0
