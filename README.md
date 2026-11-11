@@ -1,12 +1,16 @@
 # Blindfold
 
-A Claude Code plugin that keeps your secrets out of the LLM's context window. API keys, tokens, and passwords live in your OS keychain. The LLM works with placeholders like `{{API_KEY}}` and never sees the actual values.
+A Claude Code plugin that keeps your secrets out of the LLM's context window. API keys, tokens, and passwords live in your OS keychain. The LLM works with placeholders like `{{API_KEY}}` and never sees the actual values. With egress lockdown on, it goes further: a secret can only ever reach the host you bound it to.
 
 ## How it works
 
-You store a secret in your keychain. Claude references it by name. A wrapper script resolves the real value in a sandboxed subprocess and redacts it from output before Claude reads it back.
+You store a secret in your keychain. Claude refers to it by name. On macOS, every bash command Claude runs is wrapped in a Seatbelt sandbox that blocks `com.apple.SecurityServer` at the kernel level, which cuts off every way to the keychain from inside the command, however it's written.
 
-On macOS, every bash command Claude runs is wrapped in a Seatbelt sandbox that blocks `com.apple.SecurityServer` at the kernel level. The sandbox denies the Mach IPC call that all keychain access goes through. Doesn't matter how the command is constructed.
+From there, Blindfold works at one of two levels.
+
+**Basic.** `secret-exec.sh` reads the value, runs the command in the sandbox with the value filled in, and redacts the value from the output before Claude reads it. This keeps the value out of the conversation when things go as intended. It can't stop a command from sending the value somewhere else, because the command holds it.
+
+**Egress lockdown** (macOS, opt in). Sandboxed commands can only reach a local proxy. You write a policy saying which host each secret is for, and in which header or parameter. The command only ever holds the placeholder. The proxy swaps in the real value on the way to that host, scrubs it out of what comes back, can ask you first, and logs every use. A command can do whatever it likes with `{{GITLAB_TOKEN}}`: anywhere other than gitlab.com, it's just text. See [Egress lockdown](#egress-lockdown-experimental-macos).
 
 ## Installation
 
@@ -28,8 +32,10 @@ For manual install or other environments, see the [install guide](#manual-instal
 # Native password dialog opens. You type the value. Claude sees "OK: stored."
 
 > curl the gitlab API with my token
-# Claude runs: secret-exec.sh 'curl -H "PRIVATE-TOKEN: {{GITLAB_TOKEN}}" ...'
-# Output: PRIVATE-TOKEN: [REDACTED:GITLAB_TOKEN]
+# Basic: Claude runs secret-exec.sh 'curl -H "PRIVATE-TOKEN: {{GITLAB_TOKEN}}" ...'
+#        and any echoed value comes back as [REDACTED:GITLAB_TOKEN]
+# Lockdown, with a policy for GITLAB_TOKEN: Claude runs the curl directly,
+#        and the proxy fills in the token on the way to gitlab.com
 
 > what secrets do I have?
 # Lists all secrets by scope, never shows values
@@ -57,17 +63,19 @@ Secrets can be global (shared across projects) or project-scoped (tied to a spec
 
 On macOS, a PreToolUse hook wraps every bash command in a Seatbelt sandbox before execution. The sandbox blocks `com.apple.SecurityServer` at the kernel level, which cuts off all keychain access from any process inside it. Python subprocesses, base64-decoded scripts, temp file execution, doesn't matter. The block is below the shell.
 
-`secret-exec.sh` is the only path to secrets. It runs outside the sandbox, reads from the keychain, injects values as prefixed env vars (`__SV_NAME`), then runs the user command inside the sandbox. Output is redacted before Claude sees it. Claude never knows what the prefixed env vars contain because it doesn't know the `__SV_` prefix exists.
+There are two ways a value leaves the keychain. `secret-exec.sh` runs outside the sandbox, reads the value, passes it to the command in a prefixed variable (`__SV_NAME`), runs the command inside the sandbox and redacts the output. Under egress lockdown, the proxy reads it instead, and only to put it into a request to a host its policy names. With lockdown on, `secret-exec.sh` refuses any secret that has a policy, so for those the proxy is the only way. While you migrate, set `BLINDFOLD_EXEC_ANY_SECRET=1` for Claude Code to turn that refusal off. The agent can't set it for itself: a command that sets it in front of the script loses its exemption and runs in the sandbox, away from the keychain.
 
 Storing a secret goes through a native OS dialog. The value goes from your keyboard to the keychain. Claude sees "OK: stored."
 
-The same hook also covers the Read tool. If a file contains the value of any stored secret, the read is denied before Claude sees the contents.
+The same hook also covers Claude's file tools. Read is refused for a file that holds a stored value, so a value a command wrote to disk can't be read back. Write and Edit are refused for Blindfold's own scripts and config and for any `.blindfold.toml`, so the agent can't change where secrets may go.
+
+[SECURITY.md](SECURITY.md) has the full threat model, including what Blindfold doesn't protect against.
 
 On Linux, the guard hook falls back to string matching since Seatbelt is macOS only.
 
 ## Egress lockdown (experimental, macOS)
 
-By default a sandboxed command can still connect anywhere. Egress lockdown changes that. Sandboxed commands can only reach loopback, so the rest of their traffic has to go through a small local proxy, which logs every destination to `~/.local/state/blindfold/egress.jsonl`. DNS is blocked inside the sandbox, and tools that ignore `HTTPS_PROXY` will fail to connect.
+By default a sandboxed command can still connect anywhere. Egress lockdown changes that. Sandboxed commands can only reach loopback, so the rest of their traffic has to go through a small local proxy, which logs every destination to `~/.local/state/blindfold/egress.jsonl`. DNS is blocked inside the sandbox, and tools that ignore `HTTPS_PROXY` will fail to connect. Anything that isn't HTTP, like git over ssh or a remote database, can only reach this machine.
 
 To try it, build the proxy (needs Go 1.24+):
 
@@ -156,10 +164,6 @@ Every use of a secret goes in `~/.local/state/blindfold/audit.jsonl`, one line e
 ```
 
 The decisions are `filled`, `echoed` (the response held the value and it was scrubbed), and the refusals: `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `refused-approval`, `outside-slot` (a placeholder sent in a header or parameter its rule doesn't name) and `plain-http`. Query strings are never logged. If something looks off, read the refusals first. Most will be a tool misconfigured, but a refusal is also what it looks like when something tries to send a secret where it isn't allowed.
-
-Not done yet:
-
-- `secret-exec.sh` still puts real values into commands. Use the placeholder pattern above for HTTP APIs.
 
 Known limits:
 
