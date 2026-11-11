@@ -150,6 +150,12 @@ func newHarness(t *testing.T, allowedHandler http.HandlerFunc) *harness {
 		return "", errors.New("not in the keychain")
 	}
 	h.proxy = NewProxy(func(e Entry) { h.entries <- e }, lookup)
+	// No test may open a real dialog: ones that expect a question swap in
+	// their own answers
+	h.proxy.approver = newApprover(func(_ context.Context, req approvalRequest) answer {
+		t.Errorf("unexpected approval dialog for %+v", req)
+		return deny
+	})
 	h.proxy.audit = func(e AuditEntry) {
 		h.mu.Lock()
 		h.audits = append(h.audits, e)
@@ -383,10 +389,7 @@ func TestPlainHTTPIsNeverFilled(t *testing.T) {
 
 func TestMissingValueFailsTheRequest(t *testing.T) {
 	h := newHarness(t, nil)
-	pol := &Policy{Secrets: map[string]*Rule{"UNSTORED": {Hosts: []string{allowedHost}, Header: "X-Key"}}}
-	if _, err := h.proxy.SetPolicies(pol, nil); err != nil {
-		t.Fatal(err)
-	}
+	h.withPolicy(&Policy{Secrets: map[string]*Rule{"UNSTORED": {Hosts: []string{allowedHost}, Header: "X-Key"}}})
 	req := newRequest(t, "GET", "https://"+allowedHost+"/", "")
 	req.Header.Set("X-Key", "{{UNSTORED}}")
 
@@ -457,6 +460,15 @@ const (
 	tokenA       = "token-for-a"
 	projectValue = "project-a-real-value"
 )
+
+// withPolicy swaps the global policy, keeping the same hosts so the CA the
+// harness's clients trust stays the same
+func (h *harness) withPolicy(pol *Policy) {
+	h.t.Helper()
+	if _, err := h.proxy.SetPolicies(pol, nil); err != nil {
+		h.t.Fatal(err)
+	}
+}
 
 // withProject adds project A's approved policy, on the same host so the CA
 // the harness's clients trust stays the same
@@ -644,5 +656,80 @@ func TestRefusalsAreAudited(t *testing.T) {
 	}
 	if got := h.audited(auditPlainHTTP); len(got) != 1 || got[0].Secret != "MAPS_KEY" || got[0].Path != "/api" {
 		t.Errorf("plain-http = %+v", got)
+	}
+}
+
+// gated returns a harness whose GITLAB_TOKEN asks before writes, answering
+// dialogs with ans and recording what was asked
+func gated(t *testing.T, ans answer) (*harness, *[]approvalRequest) {
+	h := newHarness(t, nil)
+	h.withPolicy(&Policy{Secrets: map[string]*Rule{
+		"GITLAB_TOKEN": {Hosts: []string{allowedHost}, Header: "Private-Token", Approve: approveWrites},
+	}})
+	var asked []approvalRequest
+	h.proxy.approver = newApprover(func(_ context.Context, req approvalRequest) answer {
+		asked = append(asked, req)
+		return ans
+	})
+	return h, &asked
+}
+
+func tokenRequest(t *testing.T, method string) *http.Request {
+	req := newRequest(t, method, "https://"+allowedHost+"/api/v4/issues?private=1", "")
+	req.Header.Set("Private-Token", "{{GITLAB_TOKEN}}")
+	return req
+}
+
+func TestDeniedWriteNeverReachesTheServer(t *testing.T) {
+	h, asked := gated(t, deny)
+
+	resp := h.do(tokenRequest(t, "POST"))
+
+	if resp.StatusCode != http.StatusForbidden || len(h.allowed.requests()) != 0 {
+		t.Fatalf("status %d, forwarded %d", resp.StatusCode, len(h.allowed.requests()))
+	}
+	if _, read := h.scopeOf["GITLAB_TOKEN"]; read {
+		t.Fatal("the value was read for a request that was denied")
+	}
+	want := approvalRequest{Secret: "GITLAB_TOKEN", Method: "POST", Host: allowedHost, Path: "/api/v4/issues"}
+	if len(*asked) != 1 || (*asked)[0] != want {
+		t.Fatalf("asked %+v", *asked)
+	}
+	if got := h.audited(auditApproval); len(got) != 1 || got[0].Detail != "denied" {
+		t.Fatalf("audit = %+v", got)
+	}
+}
+
+func TestApprovedWriteIsFilledAndAudited(t *testing.T) {
+	h, _ := gated(t, allowOnce)
+
+	h.do(tokenRequest(t, "POST"))
+
+	if got := h.only(h.allowed).Header.Get("Private-Token"); got != tokenValue {
+		t.Fatalf("Private-Token = %q", got)
+	}
+	if got := h.audited(auditFilled); len(got) != 1 || got[0].Detail != "approved once" {
+		t.Fatalf("filled = %+v", got)
+	}
+}
+
+func TestReadsDoNotAskWhenOnlyWritesAreGated(t *testing.T) {
+	h, asked := gated(t, deny)
+
+	h.do(tokenRequest(t, "GET"))
+
+	if len(*asked) != 0 || h.only(h.allowed).Header.Get("Private-Token") != tokenValue {
+		t.Fatalf("asked %+v", *asked)
+	}
+}
+
+// Nothing to fill means nothing to approve, even for a gated host
+func TestRequestWithoutThePlaceholderDoesNotAsk(t *testing.T) {
+	h, asked := gated(t, deny)
+
+	h.do(newRequest(t, "POST", "https://"+allowedHost+"/public", ""))
+
+	if len(*asked) != 0 || len(h.allowed.requests()) != 1 {
+		t.Fatalf("asked %+v", *asked)
 	}
 }

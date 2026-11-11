@@ -6,9 +6,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -32,12 +34,20 @@ func main() {
 	stateFile := flag.String("state", "", "write the loaded policy's secret names, or its error, to this file")
 	private := flag.String("private", "", "folder with project tokens and approved project policies")
 	check := flag.String("check", "", "check this policy file, print the secret names it covers and exit")
+	dialog := flag.String("dialog", "", "show a dialog with these comma-separated buttons, the first being the safe one, reading the message from stdin; print the button clicked, or nothing")
+	dialogWait := flag.Duration("dialog-timeout", dialogTimeout, "how long -dialog waits for an answer")
 	bundlePath := flag.String("ca-bundle", "", "write the system roots plus the local CA to this file")
 	systemRoots := flag.String("system-roots", "/etc/ssl/cert.pem", "PEM file with the roots clients normally trust")
 	keychain := flag.String("keychain", "", "keychain to read secrets from (default: the login keychain)")
 	service := flag.String("service", "claude-secrets", "keychain service secrets are stored under")
 	accountPrefix := flag.String("account-prefix", "claude-secret", "keychain accounts are PREFIX:SCOPE:NAME")
 	flag.Parse()
+
+	if *dialog != "" {
+		msg, _ := io.ReadAll(os.Stdin)
+		fmt.Println(showDialog(context.Background(), string(msg), strings.Split(*dialog, ","), *dialogWait))
+		return
+	}
 
 	if *check != "" {
 		// Not LoadPolicy: a missing file is an error here, not an empty policy

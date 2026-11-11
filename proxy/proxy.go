@@ -38,6 +38,7 @@ type Entry struct {
 type Proxy struct {
 	record    func(Entry)
 	audit     func(AuditEntry)
+	approver  *approver
 	lookup    func(scope, name string) (string, error)
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
 	transport *http.Transport
@@ -85,7 +86,7 @@ func (st *policyState) names() []string {
 // value of a secret, preferring the project scope when one is given.
 func NewProxy(record func(Entry), lookup func(scope, name string) (string, error)) *Proxy {
 	dialer := &net.Dialer{Timeout: dialTimeout}
-	p := &Proxy{record: record, audit: func(AuditEntry) {}, lookup: lookup, dial: dialer.DialContext}
+	p := &Proxy{record: record, audit: func(AuditEntry) {}, approver: newApprover(dialogAsk), lookup: lookup, dial: dialer.DialContext}
 	p.transport = &http.Transport{
 		// Proxy is nil, so traffic never loops back through a proxy
 		DialContext:         func(ctx context.Context, n, a string) (net.Conn, error) { return p.dial(ctx, n, a) },

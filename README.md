@@ -114,6 +114,21 @@ Every policy secret is set in the sandbox's environment as its own placeholder, 
 
 Under the hood, for a policy host the proxy terminates TLS with a certificate from a local CA it makes in memory at startup. The CA is limited by name constraints to your policy hosts. Sandboxed commands trust it through `SSL_CERT_FILE` and similar variables, and it's never added to your system trust store. Traffic to every other host is tunnelled as before, untouched. The proxy picks up changes to the policy file within a second. An invalid policy turns injection off and the guard refuses commands until it's fixed, telling you what's wrong.
 
+### Asking before a secret is used
+
+A policy can ask you first. Add `approve` to a secret:
+
+```toml
+[secrets.GITLAB_TOKEN]
+hosts   = ["gitlab.com"]
+header  = "PRIVATE-TOKEN"
+approve = "writes"      # never (the default), writes, or always
+```
+
+`writes` asks before any request that isn't a GET or HEAD, and `always` asks before every one. The request waits, before the value is sent anywhere, while a Blindfold dialog shows you the secret, method, host and path. Choose Allow 30 min, Allow once, or Deny (the rightmost button), which covers that secret, method and host for half an hour so routine work doesn't turn into a stream of prompts. Deny is the default button, and no answer within 60 seconds counts as Deny. When the agent repeats a request while you're still deciding, those copies wait for the same answer instead of opening more dialogs.
+
+The path in the dialog comes from the agent, so it's shortened and shown on a line marked as the request path. If that line reads like advice about which button to press, that's the agent talking, not Blindfold.
+
 ### Project policies
 
 A project can carry its own `.blindfold.toml` in its root, in the same format, for secrets only that project uses. Since anyone can ship one in a repo, and the agent could write one, the proxy ignores it until you approve it.
@@ -140,11 +155,10 @@ Every use of a secret goes in `~/.local/state/blindfold/audit.jsonl`, one line e
 {"ts":"2026-11-11T14:02:09Z","decision":"filled","secret":"GITLAB_TOKEN","method":"POST","host":"gitlab.com","path":"/api/v4/projects/42/issues","status":201}
 ```
 
-The decisions are `filled`, `echoed` (the response held the value and it was scrubbed), and the refusals: `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `outside-slot` (a placeholder sent in a header or parameter its rule doesn't name) and `plain-http`. Query strings are never logged. If something looks off, read the refusals first. Most will be a tool misconfigured, but a refusal is also what it looks like when something tries to send a secret where it isn't allowed.
+The decisions are `filled`, `echoed` (the response held the value and it was scrubbed), and the refusals: `refused-host`, `refused-username`, `refused-missing`, `refused-encoding`, `refused-approval`, `outside-slot` (a placeholder sent in a header or parameter its rule doesn't name) and `plain-http`. Query strings are never logged. If something looks off, read the refusals first. Most will be a tool misconfigured, but a refusal is also what it looks like when something tries to send a secret where it isn't allowed.
 
 Not done yet:
 
-- Approval prompts for writes.
 - `secret-exec.sh` still puts real values into commands. Use the placeholder pattern above for HTTP APIs.
 
 Known limits:
@@ -156,6 +170,7 @@ Known limits:
 - Without lockdown, Bash commands aren't kept out of Blindfold's config. Turn lockdown on before relying on any policy.
 - Scrubbing catches the value as it was stored. A response holding it transformed, say base64-encoded, gets through, though an API doing that would be odd.
 - A placeholder in a request body isn't looked for, so `outside-slot` only covers headers and the URL. It's never filled in either way.
+- An approval needs a screen to show the dialog on. Without one, over SSH say, every gated request is denied.
 - An allowed host can still be misused. The proxy keeps a secret from going anywhere else, but it won't stop an unwanted call to the right host. Narrowly scoped tokens help.
 
 ## Files

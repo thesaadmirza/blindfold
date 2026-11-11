@@ -72,11 +72,29 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 			http.Error(w, "Blindfold: request host does not match the tunnel", e.Status)
 			return
 		}
-		used, ref := inject(r, rules, lookup)
+		// A gated secret waits here, before its value is read, until a person
+		// allows it
+		var approvals map[string]string
+		allow := func(name string) *refusal {
+			if !rules[name].NeedsApproval(r.Method) {
+				return nil
+			}
+			ans := p.approver.approve(r.Context(), approvalRequest{name, scopes[name], r.Method, host, r.URL.Path})
+			if !ans.allowed() {
+				return &refusal{name, auditApproval, http.StatusForbidden,
+					fmt.Sprintf("using %s for this request was not approved (%s)", name, ans), ans.String()}
+			}
+			if approvals == nil {
+				approvals = map[string]string{}
+			}
+			approvals[name] = ans.String()
+			return nil
+		}
+		used, ref := inject(r, rules, allow, lookup)
 		e.Secrets = used
 		if ref != nil {
-			e.Status, e.Error = http.StatusBadGateway, ref.msg
-			audit(ref.decision, ref.secret, e.Status, "")
+			e.Status, e.Error = ref.status, ref.msg
+			audit(ref.decision, ref.secret, e.Status, ref.detail)
 			http.Error(w, "Blindfold: "+ref.msg, e.Status)
 			return
 		}
@@ -120,7 +138,7 @@ func (p *Proxy) checkAndInject(host string, rules map[string]*Rule, scopes map[s
 		e.Status = rec.status
 
 		for _, name := range used {
-			audit(auditFilled, name, e.Status, "")
+			audit(auditFilled, name, e.Status, approvals[name])
 		}
 		if unreadable != "" {
 			audit(auditEncoding, "", e.Status, unreadable)
@@ -183,8 +201,10 @@ func requestHost(r *http.Request) string {
 // inject swaps each secret's placeholder for its value, but only in the one
 // slot its rule names. A placeholder anywhere else, such as the body, another
 // header or another parameter, is sent as the literal placeholder. Returns the
-// names it filled in.
-func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string, error)) ([]string, *refusal) {
+// names it filled in. allow is asked about each secret once it's known to be
+// needed and before its value is read, so a refused request never touches the
+// keychain or holds the value.
+func inject(r *http.Request, rules map[string]*Rule, allow func(string) *refusal, lookup func(string) (string, error)) ([]string, *refusal) {
 	var used []string
 	for _, name := range slices.Sorted(maps.Keys(rules)) {
 		rule, ph := rules[name], placeholder(name)
@@ -203,7 +223,7 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 				continue
 			}
 			if want := rule.BasicAuth.Username; want != "" && user != want && hasPlaceholder(pass) {
-				return used, &refusal{name, auditWrongUser, fmt.Sprintf("%s may only be used with username %q", name, want)}
+				return used, &refusal{name, auditWrongUser, http.StatusBadGateway, fmt.Sprintf("%s may only be used with username %q", name, want), ""}
 			}
 			vals = []string{pass}
 			store = func(v []string) { r.SetBasicAuth(user, v[0]) }
@@ -215,13 +235,16 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 		if !slices.ContainsFunc(vals, hasPlaceholder) {
 			continue
 		}
+		if ref := allow(name); ref != nil {
+			return used, ref
+		}
 
 		value, err := lookup(name)
 		if err == nil && value == "" {
 			err = fmt.Errorf("it's empty")
 		}
 		if err != nil {
-			return used, &refusal{name, auditMissing, fmt.Sprintf("could not read %s: %v", name, err)}
+			return used, &refusal{name, auditMissing, http.StatusBadGateway, fmt.Sprintf("could not read %s: %v", name, err), ""}
 		}
 		filled := make([]string, len(vals))
 		for i, v := range vals {
@@ -233,8 +256,12 @@ func inject(r *http.Request, rules map[string]*Rule, lookup func(string) (string
 	return used, nil
 }
 
-// refusal is why inject turned a request away, for the audit log
-type refusal struct{ secret, decision, msg string }
+// refusal is why a request was turned away, for the response and the audit log
+type refusal struct {
+	secret, decision string
+	status           int
+	msg, detail      string
+}
 
 // bufferedConn reads through the bufio.Reader the hijack returned, which may
 // already hold the start of the TLS handshake

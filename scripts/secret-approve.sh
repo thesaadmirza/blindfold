@@ -31,14 +31,11 @@ Secrets: ${names}"
 [[ -f "${PRIVATE_DIR}/trusted/${id}.toml" ]] &&
   message+="
 This replaces a policy you approved earlier for this project."
-policy=$(<"$snapshot")
-((${#policy} > 1500)) && policy="${policy:0:1500}
-[... shortened, see ${PROJECT}/${PROJECT_POLICY_FILE}]"
 message+="
 
 Approve only if you wrote this file or trust whoever did.
 
-${policy}"
+$(<"$snapshot")"
 
 decision=""
 if [[ -t 0 ]]; then
@@ -46,15 +43,12 @@ if [[ -t 0 ]]; then
   read -rp "Trust this policy? [y/N] " answer
   [[ "$answer" == [yY]* ]] && decision=trust || decision=deny
 else
-  # Deny is the default and the cancel button, so Return or Escape never trusts
-  reply=$(osascript -e 'on run argv' \
-    -e 'display dialog (item 1 of argv) with title "Blindfold" buttons {"Deny", "Trust"} default button "Deny" cancel button "Deny" giving up after 300 with icon caution' \
-    -e 'end run' "$message" 2>&1)
-  # Deny is the cancel button, which osascript reports as error -128. Any
-  # other failure, such as no GUI, is no answer, never a decision.
-  case "$reply" in
-    *"button returned:Trust"*"gave up:false"*) decision=trust ;;
-    *"(-128)"*) decision=deny ;;
+  # The proxy's dialog: Deny is the default, so Return or Escape never
+  # trusts, and the policy text is cleaned up and cut to fit. No answer, or no
+  # screen to show it on, leaves the decision for next time.
+  case "$(printf '%s' "$message" | "$PROXY_BIN" -dialog "Deny,Trust" -dialog-timeout 300s)" in
+    Trust) decision=trust ;;
+    Deny) decision=deny ;;
   esac
 fi
 
