@@ -114,9 +114,24 @@ Every policy secret is set in the sandbox's environment as its own placeholder, 
 
 Under the hood, for a policy host the proxy terminates TLS with a certificate from a local CA it makes in memory at startup. The CA is limited by name constraints to your policy hosts. Sandboxed commands trust it through `SSL_CERT_FILE` and similar variables, and it's never added to your system trust store. Traffic to every other host is tunnelled as before, untouched. The proxy picks up changes to the policy file within a second. An invalid policy turns injection off and the guard refuses commands until it's fixed, telling you what's wrong.
 
+### Project policies
+
+A project can carry its own `.blindfold.toml` in its root, in the same format, for secrets only that project uses. Since anyone can ship one in a repo, and the agent could write one, the proxy ignores it until you approve it.
+
+The first time a sandboxed command runs in a project with a new or changed `.blindfold.toml`, the command is refused and a Blindfold dialog shows you the file. Trust it and the agent's next try works. Deny it and the file is ignored until it changes. With no screen to show a dialog on, approve it from a terminal instead:
+
+```bash
+bash ~/.claude/skills/blindfold/scripts/secret-approve.sh /path/to/project
+```
+
+What you approve is an exact copy. Change one byte and it needs approving again.
+
+A project policy can't change the rule for a secret the global policy already names, so an approved project can't send your global token somewhere new. For its own secrets, the project's stored value is used first (`secret-store.sh --scope project`), then the global one.
+
+Projects are kept apart by a secret token per project, which the guard puts in the proxy URL as a password. The tokens live in `~/.config/blindfold/private/`, which sandboxed commands can't read and Claude's file tools are kept out of, so a command in one project can't pass for another.
+
 Not done yet:
 
-- Project-level `.blindfold.toml` files, with an approval step. Only the global policy is read for now.
 - Scrubbing a value from responses that echo it back, and a full audit log. The egress log already names the secrets used for each request.
 - Approval prompts for writes.
 - `secret-exec.sh` still puts real values into commands. Use the placeholder pattern above for HTTP APIs.
@@ -126,6 +141,8 @@ Known limits:
 - Go programs on macOS, including `gh`, ignore `SSL_CERT_FILE`, so they won't trust the local CA and requests to policy hosts fail. Nothing leaks, but they don't work. curl and Python trust the CA fine. The guard also sets the variables Node, git and pip read, though I haven't tried those against a policy host yet.
 - For policy hosts the proxy only speaks HTTP/1.1 to the client.
 - Tools that pin certificates won't accept the local CA.
+- A project's token is in the environment of the commands that run there, so another process of yours that can read process environments could see it. Inside the sandbox that would let a command pass for a project it's running next to.
+- Without lockdown, Bash commands aren't kept out of Blindfold's config. Turn lockdown on before relying on any policy.
 - An allowed host can still be misused. The proxy keeps a secret from going anywhere else, but it won't stop an unwanted call to the right host. Narrowly scoped tokens help.
 
 ## Files
@@ -149,6 +166,7 @@ blindfold/
 │   ├── secret-store.sh
 │   ├── secret-list.sh
 │   ├── secret-delete.sh
+│   ├── secret-approve.sh
 │   ├── secret-exec.sh
 │   ├── secret-guard.sh
 │   └── secret-redact.sh
