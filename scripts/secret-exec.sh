@@ -15,7 +15,9 @@ done
 [[ -n "$COMMAND" ]] || { echo "ERROR: Command is required." >&2; exit 1; }
 [[ -f "$REGISTRY" ]] || { echo "ERROR: Registry not found." >&2; exit 1; }
 
-PROJECT_PATH=$(get_project_path)
+# Fill get_project_path's cache in this shell, so build_sandbox_argv reuses it
+get_project_path >/dev/null
+PROJECT_PATH="$_SV_PROJECT_PATH"
 
 # Secure temp files (600 permissions, cleaned up on exit and signals)
 # Note: SIGKILL (kill -9) cannot be trapped — temp files may persist.
@@ -41,35 +43,31 @@ trap 'cleanup_temp_files; exit 129' SIGHUP
 
 echo '#!/usr/bin/env bash' > "$EXEC_SCRIPT"
 
-PLACEHOLDERS=$(echo "$COMMAND" | grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' | sort -u || true)
+# The secret names the command's {{PLACEHOLDERS}} refer to, once each
+NAMES=$(echo "$COMMAND" | grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' | tr -d '{}' | sort -u || true)
 
 # Set up the sandbox before reading any value. Under egress lockdown this also
 # says which secrets have a policy: those go through the proxy, which only
-# sends them to their own hosts, so they're never put into a command here. The
-# user can set BLINDFOLD_EXEC_ANY_SECRET=1 for Claude Code while migrating.
-# The agent can't: a command that sets it no longer matches the exempt form,
-# so it runs sandboxed, away from the keychain.
+# sends them to their own hosts, so they're never put into a command here.
+# BLINDFOLD_EXEC_ANY_SECRET=1 in Claude Code's environment turns this off
+# while migrating. A command that sets it inline loses its exemption and runs
+# sandboxed, away from the keychain, but this is a convenience switch, not a
+# barrier: see SECURITY.md on Claude Code's settings.
 build_sandbox_argv || { echo "ERROR: ${EGRESS_SETUP_ERROR} ${EGRESS_SETUP_HINT}" >&2; exit 1; }
-if [[ -z "${BLINDFOLD_EXEC_ANY_SECRET:-}" ]]; then
-  while IFS= read -r placeholder; do
-    name="${placeholder#\{\{}"
-    name="${name%\}\}}"
-    if [[ -n "$name" && " ${POLICY_NAMES[*]-} " == *" ${name} "* ]]; then
-      echo "ERROR: ${name} has a policy, so secret-exec.sh won't put its value into a command." >&2
-      echo "Run the command directly instead, with {{${name}}} or \$${name} where the value goes." >&2
-      echo "The proxy fills it in on the way to the hosts its policy allows." >&2
-      exit 1
-    fi
-  done <<< "$PLACEHOLDERS"
-fi
+while IFS= read -r name; do
+  [[ -n "$name" && -z "${BLINDFOLD_EXEC_ANY_SECRET:-}" && " ${POLICY_NAMES[*]-} " == *" ${name} "* ]] || continue
+  echo "ERROR: ${name} has a policy, so secret-exec.sh won't put its value into a command." >&2
+  echo "Run the command directly instead, with {{${name}}} or \$${name} where the value goes." >&2
+  echo "The proxy fills it in on the way to the hosts its policy allows." >&2
+  exit 1
+done <<< "$NAMES"
 
-# Resolve {{PLACEHOLDER}} secrets
+# Resolve {{PLACEHOLDER}} secrets. A separate pass from the check above, so a
+# refused secret stops the command before any value is read.
 RESOLVED_CMD="$COMMAND"
 
-while IFS= read -r placeholder; do
-  [[ -n "$placeholder" ]] || continue
-  name="${placeholder#\{\{}"
-  name="${name%\}\}}"
+while IFS= read -r name; do
+  [[ -n "$name" ]] || continue
 
   value=$(get_secret "$(make_account_key "$PROJECT_PATH" "$name")")
   [[ -n "$value" ]] || value=$(get_secret "$(make_account_key global "$name")")
@@ -78,7 +76,7 @@ while IFS= read -r placeholder; do
   printf '%s\t%s\n' "$name" "$value" >> "$REDACT_FILE"
   printf 'export __SV_%s=%q\n' "$name" "$value" >> "$EXEC_SCRIPT"
   RESOLVED_CMD="${RESOLVED_CMD//"{{${name}}}"/"\${__SV_${name}}"}"
-done <<< "$PLACEHOLDERS"
+done <<< "$NAMES"
 
 echo "$RESOLVED_CMD" >> "$EXEC_SCRIPT"
 

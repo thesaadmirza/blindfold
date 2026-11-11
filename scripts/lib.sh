@@ -120,7 +120,7 @@ build_sandbox_argv() {
   [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
 
   if egress_enabled; then
-    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" name var names=()
+    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" name var
     [[ -f "$profile" ]] && ensure_proxy || return 1
     read_policy_state
     if [[ "$STATE_STATUS" == error ]]; then
@@ -133,11 +133,10 @@ build_sandbox_argv() {
     get_project_path >/dev/null
     PROJECT_DIR=$(cd "$_SV_PROJECT_PATH" 2>/dev/null && pwd -P)
     check_project_policy || return 1
-    names=(${STATE_NAMES[@]+"${STATE_NAMES[@]}"})
+    POLICY_NAMES=(${STATE_NAMES[@]+"${STATE_NAMES[@]}"})
     for name in ${PROJECT_NAMES[@]+"${PROJECT_NAMES[@]}"}; do
-      [[ " ${names[*]-} " == *" ${name} "* ]] || names+=("$name")
+      [[ " ${POLICY_NAMES[*]-} " == *" ${name} "* ]] || POLICY_NAMES+=("$name")
     done
-    POLICY_NAMES=(${names[@]+"${names[@]}"})
 
     # A project's token, as the proxy password, tells the proxy which approved
     # project policy applies
@@ -145,7 +144,7 @@ build_sandbox_argv() {
     [[ -n "$PROJECT_TOKEN" ]] && url="http://blindfold:${PROJECT_TOKEN}@127.0.0.1:${PROXY_PORT}"
     SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
       "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts")
-    if [[ ${#names[@]} -gt 0 ]]; then
+    if [[ ${#POLICY_NAMES[@]} -gt 0 ]]; then
       # Trust the local CA, inside the sandbox only, so the proxy can open
       # TLS to policy hosts. proxy/policy.go reserves these names.
       for var in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO PIP_CERT; do
@@ -153,7 +152,7 @@ build_sandbox_argv() {
       done
       # Tools that read their token from the environment send the
       # placeholder, and the proxy fills it in for the right host
-      for name in "${names[@]}"; do
+      for name in "${POLICY_NAMES[@]}"; do
         SANDBOX_ARGV+=("${name}={{${name}}}")
       done
     fi

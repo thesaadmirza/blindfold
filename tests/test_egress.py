@@ -80,6 +80,15 @@ def _write_policy(env, body):
     path.write_text(body)
 
 
+def _store_test_secret(env, keychain, name="BFTEST_TOKEN", value="bftest-real-value"):
+    """Put a global test secret in a throwaway keychain and register its name,
+    the way secret-store.sh would"""
+    subprocess.run(["security", "add-generic-password", "-a", f"claude-secret:global:{name}",
+                    "-s", "claude-secrets", "-w", value, str(keychain)], check=True)
+    env["BLINDFOLD_KEYCHAIN"] = str(keychain)
+    run_script("secret-store.sh", ["--register-only", name], env=env)
+
+
 def _env_words(wrapped):
     """NAME=value words the guard sets before sandbox-exec"""
     words = shlex.split(wrapped)
@@ -454,11 +463,7 @@ class TestEgressRuntime:
     def test_secret_exec_still_works_where_the_proxy_does_not_apply(self, egress_env, temp_keychain, opt_out):
         # A secret with no policy, or one the user has opted out for while
         # migrating, is still filled in and redacted the old way
-        subprocess.run(["security", "add-generic-password", "-a", "claude-secret:global:BFTEST_TOKEN",
-                        "-s", "claude-secrets", "-w", "bftest-real-value", str(temp_keychain)], check=True)
-        (Path(egress_env["BLINDFOLD_REGISTRY"])).write_text(
-            '{"version":3,"global":{"secrets":["BFTEST_TOKEN"]},"projects":{}}')
-        egress_env["BLINDFOLD_KEYCHAIN"] = str(temp_keychain)
+        _store_test_secret(egress_env, temp_keychain)
         if opt_out:
             _write_policy(egress_env, POLICY)
             egress_env["BLINDFOLD_EXEC_ANY_SECRET"] = "1"
@@ -521,9 +526,7 @@ class TestEgressRuntime:
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     @pytest.mark.parametrize("header", ["{{BFTEST_TOKEN}}", "$BFTEST_TOKEN"], ids=["placeholder", "env-var"])
     def test_placeholder_is_filled_from_the_keychain(self, egress_env, temp_keychain, header):
-        subprocess.run(["security", "add-generic-password", "-a", "claude-secret:global:BFTEST_TOKEN",
-                        "-s", "claude-secrets", "-w", "bftest-real-value", str(temp_keychain)], check=True)
-        egress_env["BLINDFOLD_KEYCHAIN"] = str(temp_keychain)
+        _store_test_secret(egress_env, temp_keychain)
         _write_policy(egress_env, POLICY)
         cmd = CURL_EXAMPLE.format(extra=f'-H "X-Test-Token: {header}"')
 
