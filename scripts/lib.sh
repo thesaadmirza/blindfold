@@ -21,7 +21,8 @@ CONFIG_DIR="${BLINDFOLD_CONFIG_DIR:-$HOME/.config/blindfold}"
 POLICY_FILE="${BLINDFOLD_POLICY:-${CONFIG_DIR}/policy.toml}"
 PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-${CONFIG_DIR}/run/proxy.port}"
 CA_BUNDLE="${PROXY_PORT_FILE%/*}/ca-bundle.pem"
-# What the running proxy loaded: "ok" or "error", then the secret names
+# What the running proxy loaded: "ok" or "error", the global secret names,
+# then "@id" for each approved project in effect
 POLICY_STATE="${PROXY_PORT_FILE%/*}/policy.state"
 # Project tokens and approved project policies. Sandboxed commands can neither
 # read nor write it.
@@ -90,8 +91,8 @@ ensure_proxy() {
   mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
   rm -f "$PROXY_PORT_FILE" "$POLICY_STATE"
   local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE"
-    --state "$POLICY_STATE" --ca-bundle "$CA_BUNDLE" --service "$SERVICE"
-    --account-prefix "$(make_account_key global '')")
+    --state "$POLICY_STATE" --private "$PRIVATE_DIR" --ca-bundle "$CA_BUNDLE"
+    --service "$SERVICE" --account-prefix "$ACCOUNT_PREFIX")
   [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
   nohup "$PROXY_BIN" "${args[@]}" </dev/null >/dev/null 2>&1 &
   echo "$!" >"${PROXY_PORT_FILE%.port}.pid"
@@ -114,21 +115,20 @@ build_sandbox_argv() {
   [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
 
   if egress_enabled; then
-    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" status="" detail="" name var names=()
+    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" name var names=()
     [[ -f "$profile" ]] && ensure_proxy || return 1
-    # Read the policy as the proxy loaded it, so the two never disagree
-    {
-      read -r status
-      [[ "$status" == error ]] && read -r detail
-      while IFS= read -r name; do names+=("$name"); done
-    } <"$POLICY_STATE"
-    if [[ "$status" == error ]]; then
-      EGRESS_SETUP_ERROR="The Blindfold policy is not valid. ${detail}"
+    read_policy_state
+    if [[ "$STATE_STATUS" == error ]]; then
+      EGRESS_SETUP_ERROR="The Blindfold policy is not valid. ${STATE_DETAIL}"
       EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent."
       return 1
     fi
+    project_token || return 1
+    names=(${STATE_NAMES[@]+"${STATE_NAMES[@]}"})
 
-    local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
+    # The token, as the proxy password, tells the proxy which project's
+    # approved policy applies
+    local url="http://blindfold:${PROJECT_TOKEN}@127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
     SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
       "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts")
     if [[ ${#names[@]} -gt 0 ]]; then
@@ -145,10 +145,51 @@ build_sandbox_argv() {
     fi
     protected_dirs
     SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
-      -f "$profile")
+      -D "PRIVATE_DIR=${PROTECTED_DIRS[0]}/private" -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
   fi
+}
+
+# Reads what the running proxy loaded into STATE_STATUS ("ok" or "error"),
+# STATE_DETAIL (the error), STATE_NAMES (global secrets) and STATE_PROJECTS
+# (ids of approved projects in effect)
+read_policy_state() {
+  local line
+  STATE_STATUS="" STATE_DETAIL="" STATE_NAMES=() STATE_PROJECTS=()
+  {
+    read -r STATE_STATUS
+    [[ "$STATE_STATUS" == error ]] && read -r STATE_DETAIL
+    while IFS= read -r line; do
+      case "$line" in
+        @*) STATE_PROJECTS+=("${line#@}") ;;
+        ?*) STATE_NAMES+=("$line") ;;
+      esac
+    done
+  } <"$POLICY_STATE"
+}
+
+random_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
+
+# Sets PROJECT_TOKEN and PROJECT_ID for this project, making them the first
+# time. The token is the project's proxy password and stays secret; the id
+# only names the project's files in PRIVATE_DIR.
+project_token() {
+  local project token id path tokens="${PRIVATE_DIR}/tokens.tsv"
+  project=$(get_project_path)
+  PROJECT_TOKEN="" PROJECT_ID=""
+  if [[ -f "$tokens" ]]; then
+    while IFS=$'\t' read -r token id path; do
+      if [[ "$path" == "$project" ]]; then
+        PROJECT_TOKEN="$token" PROJECT_ID="$id"
+        return 0
+      fi
+    done <"$tokens"
+  fi
+  mkdir -p -m 700 "$PRIVATE_DIR"
+  PROJECT_TOKEN=$(random_hex 16) PROJECT_ID=$(random_hex 6)
+  [[ ${#PROJECT_TOKEN} -eq 32 && ${#PROJECT_ID} -eq 12 ]] || return 1
+  (umask 077 && printf '%s\t%s\t%s\n' "$PROJECT_TOKEN" "$PROJECT_ID" "$project" >>"$tokens")
 }
 
 # Sets PROTECTED_DIRS to the real paths of CONFIG_DIR and INSTALL_DIR, once

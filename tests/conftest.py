@@ -111,7 +111,8 @@ def test_secret_value():
 
 
 def run_script(script_name: str, args: list[str] | None = None,
-               env: dict | None = None, input_text: str | None = None) -> subprocess.CompletedProcess:
+               env: dict | None = None, input_text: str | None = None,
+               cwd: str | None = None) -> subprocess.CompletedProcess:
     """Run a blindfold bash script and return the result.
 
     Args:
@@ -119,6 +120,7 @@ def run_script(script_name: str, args: list[str] | None = None,
         args: Command-line arguments to pass
         env: Environment variables (use env_with_registry fixture for isolation)
         input_text: Text to pipe to stdin
+        cwd: Folder to run in, which decides the project the scripts see
     """
     script_path = SCRIPTS_DIR / script_name
     cmd = ["bash", str(script_path)] + (args or [])
@@ -129,6 +131,7 @@ def run_script(script_name: str, args: list[str] | None = None,
         env=env,
         input=input_text,
         timeout=30,
+        cwd=cwd,
     )
 
 
@@ -169,9 +172,9 @@ def build_file_tool_input(tool_name: str, file_path: str) -> str:
     })
 
 
-def run_guard(hook_input: str, env: dict | None = None) -> subprocess.CompletedProcess:
+def run_guard(hook_input: str, env: dict | None = None, cwd: str | None = None) -> subprocess.CompletedProcess:
     """Run secret-guard.sh with the given hook input on stdin."""
-    return run_script("secret-guard.sh", env=env, input_text=hook_input)
+    return run_script("secret-guard.sh", env=env, input_text=hook_input, cwd=cwd)
 
 
 def wrapped_command(guard_stdout: str) -> str | None:
@@ -189,9 +192,9 @@ def wrapped_command(guard_stdout: str) -> str | None:
         return None
 
 
-def wrap_through_guard(command: str, env: dict | None = None) -> str:
+def wrap_through_guard(command: str, env: dict | None = None, cwd: str | None = None) -> str:
     """Run a Bash command through the guard and return the wrapped command."""
-    result = run_guard(build_guard_input(command), env)
+    result = run_guard(build_guard_input(command), env, cwd)
     assert result.returncode == 0, f"stderr={result.stderr!r}"
     wrapped = wrapped_command(result.stdout)
     assert wrapped is not None, f"Guard did not wrap: {result.stdout!r}"

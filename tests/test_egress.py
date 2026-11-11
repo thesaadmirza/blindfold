@@ -110,7 +110,7 @@ class TestEgressWiring:
 
         port = _port_file(egress_env).read_text().strip()
         assert str(EGRESS_PROFILE) in wrapped
-        assert f"HTTPS_PROXY=http://127.0.0.1:{port}" in wrapped
+        assert re.search(rf"HTTPS_PROXY=http://blindfold:[0-9a-f]{{32}}@127\.0\.0\.1:{port}'", wrapped)
         assert "NO_PROXY=localhost,127.0.0.1,::1" in wrapped
 
     def test_a_running_proxy_is_reused(self, egress_env):
@@ -210,11 +210,57 @@ class TestEgressWiring:
         assert int(_pid_file(egress_env).read_text()) != old_pid
 
 
+
+
+@pytest.fixture()
+def project(tmp_path, egress_env):
+    """A project folder, with the approval dialog swapped for a stub that
+    records the folder it was asked about"""
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    stub = tmp_path / "approve-stub.sh"
+    stub.write_text(f'#!/bin/bash\necho "$1" > {tmp_path / "asked"}\n')
+    egress_env["BLINDFOLD_APPROVE_CMD"] = str(stub)
+    return folder
+
+
+def _private(env) -> Path:
+    return _config_dir(env) / "private"
+
+
+def _token_line(env):
+    """token, id and path of the only project the guard has seen"""
+    lines = (_private(env) / "tokens.tsv").read_text().splitlines()
+    assert len(lines) == 1, lines
+    return lines[0].split("\t")
+
+
+class TestProjectPolicies:
+
+
+    def test_each_project_gets_its_own_proxy_password(self, egress_env, project):
+        first = wrap_through_guard("echo hi", egress_env, cwd=project)
+        again = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        token, project_id, path = _token_line(egress_env)
+        assert re.fullmatch(r"[0-9a-f]{32}", token) and re.fullmatch(r"[0-9a-f]{12}", project_id)
+        assert Path(path).resolve() == project.resolve()
+        assert f"HTTPS_PROXY=http://blindfold:{token}@127.0.0.1:" in first
+        assert first == again
+        assert oct((_private(egress_env) / "tokens.tsv").stat().st_mode & 0o777) == "0o600"
+
+    def test_sandbox_is_told_about_the_private_folder(self, egress_env, project):
+        wrapped = wrap_through_guard("echo hi", egress_env, cwd=project)
+
+        assert f"PRIVATE_DIR={_config_dir(egress_env).resolve()}/private" in wrapped
+
+
 def _egress_sandbox_applies() -> bool:
     # Evaluated at collection time on every platform, so check first
     if shutil.which("sandbox-exec") is None:
         return False
-    r = subprocess.run(["sandbox-exec", "-D", "CONFIG_DIR=/nonexistent", "-D", "INSTALL_DIR=/nonexistent",
+    params = [f"{p}=/nonexistent" for p in ("CONFIG_DIR", "INSTALL_DIR", "PRIVATE_DIR", "PROJECT_POLICY")]
+    r = subprocess.run(["sandbox-exec", *[w for p in params for w in ("-D", p)],
                         "-f", str(EGRESS_PROFILE), "/usr/bin/true"],
                        capture_output=True, text=True)
     return r.returncode == 0
@@ -267,6 +313,14 @@ class TestEgressRuntime:
             assert fine.exists(), f"ordinary writes broke: stderr={result.stderr!r}"
         finally:
             script.unlink(missing_ok=True)
+
+    def test_commands_cannot_read_project_tokens(self, egress_env, project):
+        wrap_through_guard("echo hi", egress_env, cwd=project)
+        tokens = _private(egress_env) / "tokens.tsv"
+
+        result = execute_wrapped(wrap_through_guard(f"cat {tokens}", egress_env, cwd=project))
+
+        assert result.returncode != 0 and _token_line(egress_env)[0] not in result.stdout
 
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     def test_https_goes_through_the_proxy_and_is_logged(self, egress_env):
