@@ -419,13 +419,12 @@ is_private_path() {
 # can't make sense of turns lockdown on and sets SETTINGS_ERROR, so commands
 # are refused until it's fixed rather than run with a guess.
 read_settings() {
-  local line key value
+  local line
   EXEC_ANY_SECRET="" SETTINGS_ERROR=""
   [[ -f "$SETTINGS_FILE" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
-    key="${line%%=*}" value="${line#*=}"
-    case "${key}=${value}" in
+    case "$line" in
       BLINDFOLD_EGRESS=proxy) BLINDFOLD_EGRESS=proxy ;;
       BLINDFOLD_EGRESS=) ;;
       BLINDFOLD_EXEC_ANY_SECRET=1) EXEC_ANY_SECRET=1 ;;
