@@ -52,7 +52,7 @@ def proxy_bin(tmp_path_factory):
 
 
 def _port_file(env) -> Path:
-    return Path(env["BLINDFOLD_PROXY_PORT_FILE"])
+    return Path(env["BLINDFOLD_CONFIG_DIR"]) / "run" / "proxy.port"
 
 
 def _pid_file(env) -> Path:
@@ -66,7 +66,7 @@ def egress_env(tmp_path, temp_registry, proxy_bin):
     env.update({
         "BLINDFOLD_EGRESS": "proxy",
         "BLINDFOLD_PROXY_BIN": str(proxy_bin),
-        "BLINDFOLD_PROXY_PORT_FILE": str(tmp_path / "run" / "proxy.port"),
+        "BLINDFOLD_CONFIG_DIR": str(tmp_path / "config"),
         "BLINDFOLD_EGRESS_LOG": str(tmp_path / "egress.jsonl"),
         "BLINDFOLD_REGISTRY": str(temp_registry),
     })
@@ -113,6 +113,13 @@ class TestEgressWiring:
         assert str(BASE_PROFILE) in wrapped
         assert "HTTPS_PROXY" not in wrapped
 
+    def test_sandbox_is_told_which_folders_to_protect(self, egress_env):
+        wrapped = wrap_through_guard("echo hi", egress_env)
+
+        config = Path(egress_env["BLINDFOLD_CONFIG_DIR"]).resolve()
+        assert f"CONFIG_DIR={config}" in wrapped
+        assert f"INSTALL_DIR={SCRIPTS_DIR.parent.resolve()}" in wrapped
+
     def test_egress_profile_keeps_every_base_rule(self):
         egress_rules = set(EGRESS_PROFILE.read_text().splitlines())
         missing = [line for line in BASE_PROFILE.read_text().splitlines() if line not in egress_rules]
@@ -124,7 +131,8 @@ def _egress_sandbox_applies() -> bool:
     # Evaluated at collection time on every platform, so check first
     if shutil.which("sandbox-exec") is None:
         return False
-    r = subprocess.run(["sandbox-exec", "-f", str(EGRESS_PROFILE), "/usr/bin/true"],
+    r = subprocess.run(["sandbox-exec", "-D", "CONFIG_DIR=/nonexistent", "-D", "INSTALL_DIR=/nonexistent",
+                        "-f", str(EGRESS_PROFILE), "/usr/bin/true"],
                        capture_output=True, text=True)
     return r.returncode == 0
 
@@ -163,6 +171,19 @@ class TestEgressRuntime:
         result = run_script("secret-exec.sh", [DIRECT_CONNECT], env=egress_env)
 
         assert result.returncode != 0, "secret-exec let a direct connection out"
+
+    def test_commands_cannot_write_blindfold_files(self, egress_env, tmp_path):
+        policy = Path(egress_env["BLINDFOLD_CONFIG_DIR"]) / "policy.toml"
+        script = SCRIPTS_DIR / ".write-probe"
+        fine = tmp_path / "fine.txt"
+        cmd = f"echo x > {policy}; echo x > {script}; echo x > {fine}"
+        try:
+            result = execute_wrapped(wrap_through_guard(cmd, egress_env))
+            assert not policy.exists(), "a sandboxed command wrote the policy"
+            assert not script.exists(), "a sandboxed command wrote into Blindfold's scripts"
+            assert fine.exists(), f"ordinary writes broke: stderr={result.stderr!r}"
+        finally:
+            script.unlink(missing_ok=True)
 
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     def test_https_goes_through_the_proxy_and_is_logged(self, egress_env):

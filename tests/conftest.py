@@ -160,6 +160,15 @@ def build_read_input(file_path: str) -> str:
     })
 
 
+def build_file_tool_input(tool_name: str, file_path: str) -> str:
+    """Build PreToolUse hook input JSON for Write, Edit, MultiEdit or NotebookEdit."""
+    key = "notebook_path" if tool_name == "NotebookEdit" else "file_path"
+    return json.dumps({
+        "tool_name": tool_name,
+        "tool_input": {key: file_path},
+    })
+
+
 def run_guard(hook_input: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """Run secret-guard.sh with the given hook input on stdin."""
     return run_script("secret-guard.sh", env=env, input_text=hook_input)

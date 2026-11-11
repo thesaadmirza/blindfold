@@ -131,6 +131,10 @@ Add hooks to `~/.claude/settings.json`:
       {
         "matcher": "Read",
         "hooks": [{"type": "command", "command": "bash ~/.claude/skills/blindfold/scripts/secret-guard.sh", "timeout": 10}]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [{"type": "command", "command": "bash ~/.claude/skills/blindfold/scripts/secret-guard.sh", "timeout": 5}]
       }
     ],
     "PostToolUse": [

@@ -14,8 +14,11 @@ BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
 
 # Callers that already know this directory can set _SV_LIB_DIR first and skip the lookup
 _SV_LIB_DIR="${_SV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+INSTALL_DIR="${_SV_LIB_DIR%/scripts}"
 PROXY_BIN="${BLINDFOLD_PROXY_BIN:-${_SV_LIB_DIR}/../bin/blindfold-proxy}"
-PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-$HOME/.config/blindfold/run/proxy.port}"
+# Config the agent must not change: the policy and the proxy's run files
+CONFIG_DIR="${BLINDFOLD_CONFIG_DIR:-$HOME/.config/blindfold}"
+PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-${CONFIG_DIR}/run/proxy.port}"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
@@ -100,10 +103,54 @@ build_sandbox_argv() {
     local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
     SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
       "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts"
-      sandbox-exec -f "$profile")
+      sandbox-exec -D "CONFIG_DIR=$(real_dir "$CONFIG_DIR")" -D "INSTALL_DIR=$(real_dir "$INSTALL_DIR")"
+      -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
   fi
+}
+
+# Prints the real path of a directory, creating it first, since Seatbelt
+# matches resolved paths and the profile needs one that exists
+real_dir() {
+  mkdir -p "$1" 2>/dev/null
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+# True when path, once symlinks and .. are resolved, is inside CONFIG_DIR or
+# INSTALL_DIR. The agent's file tools go through this, since they run outside
+# the sandbox.
+is_protected_path() {
+  local path="$1" rest="" dir hops
+  # Follow a symlink at the end, a few hops at most
+  for ((hops = 0; hops < 8; hops++)); do
+    [[ -L "$path" ]] || break
+    local target
+    target=$(readlink "$path")
+    [[ "$target" == /* ]] && path="$target" || path="$(dirname "$path")/${target}"
+  done
+  # Resolve the deepest part that exists. A .. in the part that doesn't exist
+  # yet can't be resolved here, so treat it as protected rather than guess.
+  dir="$path"
+  while [[ -n "$dir" && ! -d "$dir" ]]; do
+    rest="/$(basename "$dir")${rest}"
+    dir=$(dirname "$dir")
+  done
+  [[ "$rest" == */../* || "$rest" == */.. ]] && return 0
+  # A hard link made from inside the sandbox would let a file tool write a
+  # protected file under another name, so refuse files with more than one
+  if [[ -f "$path" ]]; then
+    local links
+    links=$(stat -f %l "$path" 2>/dev/null || stat -c %h "$path" 2>/dev/null)
+    [[ "${links:-1}" -gt 1 ]] && return 0
+  fi
+  local real
+  real="$(cd "$dir" 2>/dev/null && pwd -P)${rest}"
+  local protected
+  for protected in "$(real_dir "$CONFIG_DIR")" "$(real_dir "$INSTALL_DIR")"; do
+    [[ "$real" == "$protected" || "$real" == "$protected"/* ]] && return 0
+  done
+  return 1
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."

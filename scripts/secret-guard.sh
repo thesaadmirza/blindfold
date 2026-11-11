@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# PreToolUse hook: enforces kernel-level sandbox on Bash commands (macOS Seatbelt)
-# and keeps Read away from files that hold a stored secret value.
+# PreToolUse hook: enforces kernel-level sandbox on Bash commands (macOS Seatbelt),
+# keeps Read away from files that hold a stored secret value, and keeps the
+# file-editing tools away from Blindfold's config and code.
 # Exit 0 with JSON = allow (possibly with modified command)
 # Exit 2 = deny
 set -uo pipefail
@@ -11,7 +12,10 @@ INPUT=$(</dev/stdin)
 
 # Read each field on its own: @tsv would turn real newlines into a literal \n
 TOOL_NAME=$(jq -r '.tool_name // ""' <<< "$INPUT" 2>/dev/null)
-[[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "Read" ]] || exit 0
+case "$TOOL_NAME" in
+  Bash | Read | Write | Edit | MultiEdit | NotebookEdit) ;;
+  *) exit 0 ;;
+esac
 
 _SV_LIB_DIR="$SCRIPT_DIR"
 source "${SCRIPT_DIR}/lib.sh"
@@ -22,6 +26,16 @@ deny() {
   echo "${2:-Use secret-exec.sh to run commands that need secrets.}" >&2
   exit 2
 }
+
+# File tools run outside the sandbox, so the sandbox's write rules don't cover
+# them. Refuse edits to the policy, the proxy's files and Blindfold's scripts.
+if [[ "$TOOL_NAME" != "Bash" && "$TOOL_NAME" != "Read" ]]; then
+  FILE_PATH=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<< "$INPUT" 2>/dev/null)
+  [[ -n "$FILE_PATH" ]] || exit 0
+  is_protected_path "$FILE_PATH" &&
+    deny "${FILE_PATH} is Blindfold's own config or code." "Edit it yourself, outside the agent."
+  exit 0
+fi
 
 # Read: refuse a file that contains any stored value, e.g. one a command wrote
 # a secret into. Checked before the read, since output can't be redacted after.
