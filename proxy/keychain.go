@@ -10,41 +10,56 @@ import (
 )
 
 const (
-	keychainService = "claude-secrets"
-	accountPrefix   = "claude-secret:global:"
-	valueCacheTTL   = time.Minute
+	valueCacheTTL = time.Minute
+	missCacheTTL  = 5 * time.Second
 )
 
-// keychainLookup reads global secrets the way lib.sh stores them. Values are
-// kept in memory for a minute so a burst of requests doesn't run `security`
-// each time, and a rotated secret is picked up soon after.
-func keychainLookup(keychain string) func(string) (string, error) {
-	type cached struct {
+// keychainLookup reads global secrets the way lib.sh stores them: service
+// and account prefix come from the guard so the two can't drift apart.
+// Values are cached for a minute so a burst of requests doesn't run
+// `security` each time, and a rotated secret is picked up soon after.
+func keychainLookup(keychain, service, accountPrefix string) func(string) (string, error) {
+	type entry struct {
+		mu    sync.Mutex
 		value string
+		err   error
 		at    time.Time
 	}
 	var mu sync.Mutex
-	cache := map[string]cached{}
+	entries := map[string]*entry{}
 
 	return func(name string) (string, error) {
 		mu.Lock()
-		defer mu.Unlock()
-		if c, ok := cache[name]; ok && time.Since(c.at) < valueCacheTTL {
-			return c.value, nil
+		e, ok := entries[name]
+		if !ok {
+			e = &entry{}
+			entries[name] = e
+		}
+		mu.Unlock()
+
+		// One lock per secret, so a slow keychain read for one never holds
+		// up requests that need another
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		ttl := valueCacheTTL
+		if e.err != nil {
+			ttl = missCacheTTL
+		}
+		if !e.at.IsZero() && time.Since(e.at) < ttl {
+			return e.value, e.err
 		}
 
-		args := []string{"find-generic-password", "-a", accountPrefix + name, "-s", keychainService, "-w"}
+		args := []string{"find-generic-password", "-a", accountPrefix + name, "-s", service, "-w"}
 		if keychain != "" {
 			args = append(args, keychain)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		out, err := exec.CommandContext(ctx, "security", args...).Output()
+		e.value, e.err, e.at = strings.TrimSuffix(string(out), "\n"), nil, time.Now()
 		if err != nil {
-			return "", errors.New("not found in the keychain")
+			e.value, e.err = "", errors.New("not found in the keychain")
 		}
-		value := strings.TrimSuffix(string(out), "\n")
-		cache[name] = cached{value, time.Now()}
-		return value, nil
+		return e.value, e.err
 	}
 }

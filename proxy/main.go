@@ -27,6 +27,8 @@ func main() {
 	bundlePath := flag.String("ca-bundle", "", "write the system roots plus the local CA to this file")
 	systemRoots := flag.String("system-roots", "/etc/ssl/cert.pem", "PEM file with the roots clients normally trust")
 	keychain := flag.String("keychain", "", "keychain to read secrets from (default: the login keychain)")
+	service := flag.String("service", "claude-secrets", "keychain service secrets are stored under")
+	accountPrefix := flag.String("account-prefix", "claude-secret:global:", "prefix of a secret's keychain account")
 	printSecrets := flag.Bool("print-secrets", false, "check the policy, print the secret names it covers and exit")
 	flag.Parse()
 
@@ -50,7 +52,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	proxy := NewProxy(record, keychainLookup(*keychain))
+	proxy := NewProxy(record, keychainLookup(*keychain, *service, *accountPrefix))
 	w := &policyWatcher{proxy: proxy, path: *policyPath, bundle: *bundlePath, roots: *systemRoots}
 	// The bundle has to exist before the port file says the proxy is up
 	if err := w.reload(); err != nil {

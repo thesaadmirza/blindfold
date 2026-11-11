@@ -85,7 +85,8 @@ ensure_proxy() {
   [[ "$old_pid" =~ ^[0-9]+$ ]] && kill "$old_pid" 2>/dev/null
   mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
   rm -f "$PROXY_PORT_FILE"
-  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE" --ca-bundle "$CA_BUNDLE")
+  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE" --ca-bundle "$CA_BUNDLE"
+    --service "$SERVICE" --account-prefix "$(make_account_key global '')")
   [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
   nohup "$PROXY_BIN" "${args[@]}" </dev/null >/dev/null 2>&1 &
   echo "$!" >"$pid_file"
