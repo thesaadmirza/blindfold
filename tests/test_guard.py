@@ -10,6 +10,7 @@ import pytest
 
 from conftest import (
     SCRIPTS_DIR,
+    build_file_tool_input,
     build_guard_input,
     build_read_input,
     execute_wrapped,
@@ -157,4 +158,72 @@ class TestReadGuard:
         result = self._read(self.dir / "does-not-exist")
 
         assert result.returncode == 0
+        assert result.stdout.strip() == ""
+
+
+class TestBlindfoldFilesAreProtected:
+    """The agent's file tools run outside the sandbox, so the guard has to
+    keep them off the policy, the proxy's files and Blindfold's own code."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.config = tmp_path / "config"
+        self.config.mkdir()
+        self.env = os.environ.copy()
+        self.env["BLINDFOLD_CONFIG_DIR"] = str(self.config)
+        self.dir = tmp_path
+
+    def _edit(self, path, tool="Write"):
+        return run_guard(build_file_tool_input(tool, str(path)), self.env)
+
+    @pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit"])
+    def test_policy_file_is_refused(self, tool):
+        result = self._edit(self.config / "policy.toml", tool)
+
+        assert result.returncode == 2, f"stderr={result.stderr!r}"
+        assert "DENIED by Blindfold" in result.stderr
+
+    def test_blindfold_scripts_are_refused(self):
+        assert self._edit(SCRIPTS_DIR / "lib.sh", "Edit").returncode == 2
+
+    def test_new_file_in_a_missing_config_subfolder_is_refused(self):
+        assert self._edit(self.config / "run" / "new" / "proxy.port").returncode == 2
+
+    def test_path_through_a_symlinked_folder_is_refused(self):
+        link = self.dir / "innocent"
+        link.symlink_to(self.config)
+
+        assert self._edit(link / "policy.toml").returncode == 2
+
+    def test_symlinked_file_is_refused(self):
+        (self.config / "policy.toml").write_text("")
+        link = self.dir / "notes.toml"
+        link.symlink_to(self.config / "policy.toml")
+
+        assert self._edit(link, "Edit").returncode == 2
+
+    def test_dotdot_through_a_missing_folder_is_refused(self):
+        sneaky = f"{self.dir}/nope/../config/policy.toml"
+
+        assert self._edit(sneaky).returncode == 2
+
+    def test_hard_linked_file_is_refused(self):
+        (self.config / "policy.toml").write_text("")
+        alias = self.dir / "alias.toml"
+        os.link(self.config / "policy.toml", alias)
+
+        assert self._edit(alias, "Edit").returncode == 2
+
+    def test_hard_linked_file_elsewhere_is_allowed(self):
+        # pnpm and similar tools hard-link files; only links into Blindfold count
+        (self.dir / "store.js").write_text("")
+        os.link(self.dir / "store.js", self.dir / "linked.js")
+
+        assert self._edit(self.dir / "linked.js", "Edit").returncode == 0
+
+    @pytest.mark.parametrize("name", ["notes.md", "sub/new.py"])
+    def test_ordinary_files_are_allowed(self, name):
+        result = self._edit(self.dir / "project" / name)
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert result.stdout.strip() == ""

@@ -1,6 +1,11 @@
 (version 1)
 (allow default)
 (deny mach-lookup (global-name "com.apple.SecurityServer"))
+; Blindfold's config and its own scripts stay read-only, so a command can't
+; widen where secrets may go or change what the hooks do. This lives here and
+; not in sandbox.sb because macOS won't apply a profile with file rules inside
+; another sandbox, and the base profile has to keep working inside one.
+(deny file-write* (subpath (param "CONFIG_DIR")) (subpath (param "INSTALL_DIR")))
 ; Outbound traffic may only reach loopback, where the Blindfold proxy and any
 ; local dev servers listen. Everything else has to go through the proxy.
 (deny network-outbound)

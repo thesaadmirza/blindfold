@@ -14,14 +14,22 @@ BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
 
 # Callers that already know this directory can set _SV_LIB_DIR first and skip the lookup
 _SV_LIB_DIR="${_SV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+INSTALL_DIR="${_SV_LIB_DIR%/scripts}"
 PROXY_BIN="${BLINDFOLD_PROXY_BIN:-${_SV_LIB_DIR}/../bin/blindfold-proxy}"
-PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-$HOME/.config/blindfold/run/proxy.port}"
+# Config the agent must not change: the policy and the proxy's run files
+CONFIG_DIR="${BLINDFOLD_CONFIG_DIR:-$HOME/.config/blindfold}"
+POLICY_FILE="${BLINDFOLD_POLICY:-${CONFIG_DIR}/policy.toml}"
+PROXY_PORT_FILE="${BLINDFOLD_PROXY_PORT_FILE:-${CONFIG_DIR}/run/proxy.port}"
+CA_BUNDLE="${PROXY_PORT_FILE%/*}/ca-bundle.pem"
+# What the running proxy loaded: "ok" or "error", then the secret names
+POLICY_STATE="${PROXY_PORT_FILE%/*}/policy.state"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
 _SV_PLATFORM=""
+PROTECTED_DIRS=()
 
 # Returns the keychain path arg for security commands, or empty if using login keychain.
 _keychain_arg() {
@@ -61,21 +69,28 @@ egress_enabled() {
   [[ "$BLINDFOLD_EGRESS" == "proxy" && "$OSTYPE" == darwin* ]]
 }
 
-# Sets PROXY_PORT to a running proxy, starting one first if needed. The wait is
-# capped at 2s so a slow start fails cleanly inside the hook's 5s timeout.
+# Sets PROXY_PORT to a running proxy, starting one first if needed. The proxy
+# exits by itself when its binary is rebuilt, so a dead port means "start it".
+# A proxy without a state file predates policies and is replaced too. The wait
+# is capped at 2s so a slow start fails cleanly inside the hook's 5s timeout.
 ensure_proxy() {
   local i
   PROXY_PORT=""
   read -r PROXY_PORT <"$PROXY_PORT_FILE" 2>/dev/null
-  if [[ -n "$PROXY_PORT" ]] && { true <>"/dev/tcp/127.0.0.1/${PROXY_PORT}"; } 2>/dev/null; then
+  if [[ -n "$PROXY_PORT" && -f "$POLICY_STATE" ]] &&
+    { true <>"/dev/tcp/127.0.0.1/${PROXY_PORT}"; } 2>/dev/null; then
     return 0
   fi
   [[ -x "$PROXY_BIN" ]] || return 1
 
   mkdir -p -m 700 "$(dirname "$PROXY_PORT_FILE")"
-  rm -f "$PROXY_PORT_FILE"
-  nohup "$PROXY_BIN" --port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" </dev/null >/dev/null 2>&1 &
-  echo "$!" > "${PROXY_PORT_FILE%.port}.pid"
+  rm -f "$PROXY_PORT_FILE" "$POLICY_STATE"
+  local args=(--port-file "$PROXY_PORT_FILE" --log "$EGRESS_LOG" --policy "$POLICY_FILE"
+    --state "$POLICY_STATE" --ca-bundle "$CA_BUNDLE" --service "$SERVICE"
+    --account-prefix "$(make_account_key global '')")
+  [[ -n "$BLINDFOLD_KEYCHAIN" ]] && args+=(--keychain "$BLINDFOLD_KEYCHAIN")
+  nohup "$PROXY_BIN" "${args[@]}" </dev/null >/dev/null 2>&1 &
+  echo "$!" >"${PROXY_PORT_FILE%.port}.pid"
   for ((i = 0; i < 100; i++)); do
     if [[ -s "$PROXY_PORT_FILE" ]]; then
       read -r PROXY_PORT <"$PROXY_PORT_FILE"
@@ -95,15 +110,88 @@ build_sandbox_argv() {
   [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
 
   if egress_enabled; then
-    local profile="${_SV_LIB_DIR}/sandbox-egress.sb"
+    local profile="${_SV_LIB_DIR}/sandbox-egress.sb" status="" detail="" name var names=()
     [[ -f "$profile" ]] && ensure_proxy || return 1
+    # Read the policy as the proxy loaded it, so the two never disagree
+    {
+      read -r status
+      [[ "$status" == error ]] && read -r detail
+      while IFS= read -r name; do names+=("$name"); done
+    } <"$POLICY_STATE"
+    if [[ "$status" == error ]]; then
+      EGRESS_SETUP_ERROR="The Blindfold policy is not valid. ${detail}"
+      EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent."
+      return 1
+    fi
+
     local url="http://127.0.0.1:${PROXY_PORT}" local_hosts="localhost,127.0.0.1,::1"
     SANDBOX_ARGV=(env "HTTPS_PROXY=$url" "https_proxy=$url" "HTTP_PROXY=$url" "http_proxy=$url"
-      "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts"
-      sandbox-exec -f "$profile")
+      "ALL_PROXY=$url" "all_proxy=$url" "NO_PROXY=$local_hosts" "no_proxy=$local_hosts")
+    if [[ ${#names[@]} -gt 0 ]]; then
+      # Trust the local CA, inside the sandbox only, so the proxy can open
+      # TLS to policy hosts. proxy/policy.go reserves these names.
+      for var in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS GIT_SSL_CAINFO PIP_CERT; do
+        SANDBOX_ARGV+=("${var}=${CA_BUNDLE}")
+      done
+      # Tools that read their token from the environment send the
+      # placeholder, and the proxy fills it in for the right host
+      for name in "${names[@]}"; do
+        SANDBOX_ARGV+=("${name}={{${name}}}")
+      done
+    fi
+    protected_dirs
+    SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
+      -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
   fi
+}
+
+# Sets PROTECTED_DIRS to the real paths of CONFIG_DIR and INSTALL_DIR, once
+# per run. They're created first, since Seatbelt matches resolved paths and
+# the profile needs ones that exist.
+protected_dirs() {
+  [[ ${#PROTECTED_DIRS[@]} -gt 0 ]] && return 0
+  local d
+  for d in "$CONFIG_DIR" "$INSTALL_DIR"; do
+    [[ -d "$d" ]] || mkdir -p "$d" 2>/dev/null
+    PROTECTED_DIRS+=("$(cd "$d" 2>/dev/null && pwd -P)")
+  done
+}
+
+# True when path, once symlinks and .. are resolved, is inside CONFIG_DIR or
+# INSTALL_DIR. The agent's file tools go through this, since they run outside
+# the sandbox.
+is_protected_path() {
+  local path="$1" rest="" dir target hops links inode real protected
+  protected_dirs
+  # Follow a symlink at the end, a few hops at most
+  for ((hops = 0; hops < 8; hops++)); do
+    [[ -L "$path" ]] || break
+    target=$(readlink "$path")
+    [[ "$target" == /* ]] && path="$target" || path="${path%/*}/${target}"
+  done
+  # Resolve the deepest part that exists. A .. in the part that doesn't exist
+  # yet can't be resolved here, so treat it as protected rather than guess.
+  dir="$path"
+  while [[ -n "$dir" && ! -d "$dir" ]]; do
+    rest="/${dir##*/}${rest}"
+    [[ "$dir" == */* ]] && dir="${dir%/*}" || dir="."
+  done
+  [[ "$rest" == */../* || "$rest" == */.. ]] && return 0
+  real="$(cd "${dir:-/}" 2>/dev/null && pwd -P)${rest}"
+  for protected in "${PROTECTED_DIRS[@]}"; do
+    [[ "$real" == "$protected" || "$real" == "$protected"/* ]] && return 0
+  done
+  # A hard link made inside the sandbox could give a protected file a second
+  # name. Only multiply-linked files need the (slower) inode search.
+  [[ -f "$path" ]] || return 1
+  # GNU stat first: on Linux `stat -f` means file system status and succeeds
+  # with unrelated output, while BSD stat simply rejects -c
+  read -r links inode < <(stat -c '%h %i' "$path" 2>/dev/null || stat -f '%l %i' "$path" 2>/dev/null)
+  [[ "$links" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ ]] || return 1
+  [[ "$links" -gt 1 ]] || return 1
+  [[ -n "$(find "${PROTECTED_DIRS[@]}" -xdev -inum "$inode" -print -quit 2>/dev/null)" ]]
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."

@@ -20,7 +20,7 @@ import (
 func startProxy(t *testing.T) (*url.URL, <-chan Entry) {
 	t.Helper()
 	entries := make(chan Entry, 16)
-	srv := httptest.NewServer(NewProxy(func(e Entry) { entries <- e }))
+	srv := httptest.NewServer(NewProxy(func(e Entry) { entries <- e }, nil))
 	t.Cleanup(srv.Close)
 	u, _ := url.Parse(srv.URL)
 	return u, entries

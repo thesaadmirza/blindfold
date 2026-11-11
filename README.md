@@ -67,9 +67,7 @@ On Linux, the guard hook falls back to string matching since Seatbelt is macOS o
 
 ## Egress lockdown (experimental, macOS)
 
-By default a sandboxed command can still connect anywhere. Egress lockdown changes that. Sandboxed commands can only reach loopback, so the rest of their traffic has to go through a small local proxy, which logs every destination to `~/.local/state/blindfold/egress.jsonl`.
-
-This first version only tunnels. It doesn't inject secrets or block hosts yet, so it doesn't stop a secret from leaving through `secret-exec.sh`. It's for finding out what your tools need before the stricter parts of [the design](docs/design/destination-binding.md) land. DNS is blocked inside the sandbox, and tools that ignore `HTTPS_PROXY` will fail to connect.
+By default a sandboxed command can still connect anywhere. Egress lockdown changes that. Sandboxed commands can only reach loopback, so the rest of their traffic has to go through a small local proxy, which logs every destination to `~/.local/state/blindfold/egress.jsonl`. DNS is blocked inside the sandbox, and tools that ignore `HTTPS_PROXY` will fail to connect.
 
 To try it, build the proxy (needs Go 1.24+):
 
@@ -77,9 +75,58 @@ To try it, build the proxy (needs Go 1.24+):
 bash ~/.claude/skills/blindfold/scripts/build-proxy.sh
 ```
 
-Then set `BLINDFOLD_EGRESS=proxy` for Claude Code, for example in the `env` block of `~/.claude/settings.json`. The guard starts the proxy on first use. If the proxy can't start, commands are refused rather than run without the lockdown.
+Then set `BLINDFOLD_EGRESS=proxy` for Claude Code, for example in the `env` block of `~/.claude/settings.json`. The guard starts the proxy on first use, and restarts it after you rebuild it. If the proxy can't start, commands are refused rather than run without the lockdown.
 
 macOS won't apply this profile inside another sandbox. If Claude Code's own sandbox is on, commands under egress lockdown fail to start.
+
+Under lockdown, sandboxed commands can't write to `~/.config/blindfold/` or to Blindfold's own folder, and the guard stops Claude's Write and Edit tools from changing them too.
+
+### Binding a secret to its host
+
+With lockdown on, you can say where each secret may go, and then the command never holds the real value at all. It sends a placeholder. The proxy swaps in the value on the way to the host you named, in the header or parameter you named, and nowhere else.
+
+Write `~/.config/blindfold/policy.toml` yourself (the agent can't):
+
+```toml
+[secrets.GITLAB_TOKEN]
+hosts  = ["gitlab.com"]
+header = "PRIVATE-TOKEN"
+
+[secrets.REGISTRY_PASSWORD]
+hosts      = ["registry.example.com"]
+basic_auth = { username = "deploy-bot" }
+
+[secrets.MAPS_KEY]
+hosts = ["maps.googleapis.com"]
+query = "key"
+```
+
+Each secret gets exactly one of `header`, `basic_auth` or `query`. Hosts are exact names: no wildcards, IP addresses or ports. The secret has to be stored globally (`secret-store.sh --scope global`).
+
+Then a plain command works, and the agent never sees the value:
+
+```bash
+curl -H "PRIVATE-TOKEN: {{GITLAB_TOKEN}}" https://gitlab.com/api/v4/user
+curl -H "PRIVATE-TOKEN: $GITLAB_TOKEN" https://gitlab.com/api/v4/user   # same thing
+```
+
+Every policy secret is set in the sandbox's environment as its own placeholder, so tools that read a token from the environment pick it up too. If the agent sends `{{GITLAB_TOKEN}}` anywhere else, such as another host, a request body, another header, or plain HTTP, it goes out as that literal text.
+
+Under the hood, for a policy host the proxy terminates TLS with a certificate from a local CA it makes in memory at startup. The CA is limited by name constraints to your policy hosts. Sandboxed commands trust it through `SSL_CERT_FILE` and similar variables, and it's never added to your system trust store. Traffic to every other host is tunnelled as before, untouched. The proxy picks up changes to the policy file within a second. An invalid policy turns injection off and the guard refuses commands until it's fixed, telling you what's wrong.
+
+Not done yet:
+
+- Project-level `.blindfold.toml` files, with an approval step. Only the global policy is read for now.
+- Scrubbing a value from responses that echo it back, and a full audit log. The egress log already names the secrets used for each request.
+- Approval prompts for writes.
+- `secret-exec.sh` still puts real values into commands. Use the placeholder pattern above for HTTP APIs.
+
+Known limits:
+
+- Go programs on macOS, including `gh`, ignore `SSL_CERT_FILE`, so they won't trust the local CA and requests to policy hosts fail. Nothing leaks, but they don't work. curl and Python trust the CA fine. The guard also sets the variables Node, git and pip read, though I haven't tried those against a policy host yet.
+- For policy hosts the proxy only speaks HTTP/1.1 to the client.
+- Tools that pin certificates won't accept the local CA.
+- An allowed host can still be misused. The proxy keeps a secret from going anywhere else, but it won't stop an unwanted call to the right host. Narrowly scoped tokens help.
 
 ## Files
 
@@ -93,7 +140,7 @@ blindfold/
 │       └── SKILL.md
 ├── hooks/
 │   └── hooks.json
-├── proxy/              # egress proxy (Go)
+├── proxy/              # egress proxy and policy injection (Go)
 ├── scripts/
 │   ├── build-proxy.sh
 │   ├── lib.sh
@@ -131,6 +178,10 @@ Add hooks to `~/.claude/settings.json`:
       {
         "matcher": "Read",
         "hooks": [{"type": "command", "command": "bash ~/.claude/skills/blindfold/scripts/secret-guard.sh", "timeout": 10}]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [{"type": "command", "command": "bash ~/.claude/skills/blindfold/scripts/secret-guard.sh", "timeout": 5}]
       }
     ],
     "PostToolUse": [

@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,32 +27,67 @@ type Entry struct {
 	Received int64  `json:"received,omitempty"`
 	Millis   int64  `json:"ms"`
 	Error    string `json:"error,omitempty"`
+	// Secrets lists the secrets whose values were put into the request
+	Secrets []string `json:"secrets,omitempty"`
 }
 
-// Proxy tunnels CONNECT requests and forwards plain HTTP ones. It never looks
-// inside a tunnel and never touches secrets.
+// Proxy tunnels CONNECT requests and forwards plain HTTP ones. Tunnels to
+// hosts a policy names on port 443 are intercepted instead, so the secret
+// meant for that host can be put into the request. Everything else passes
+// through untouched.
 type Proxy struct {
 	record    func(Entry)
+	lookup    func(name string) (string, error)
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
+	transport *http.Transport
 	forwarder *httputil.ReverseProxy
+	state     atomic.Pointer[policyState]
 }
 
-func NewProxy(record func(Entry)) *Proxy {
+// policyState is swapped whole when the policy changes, so a request never
+// sees a policy from one version and a CA from another
+type policyState struct {
+	policy *Policy
+	ca     *authority // nil when the policy names no hosts
+}
+
+// NewProxy returns a proxy with an empty policy. lookup returns the stored
+// value of a secret by name.
+func NewProxy(record func(Entry), lookup func(string) (string, error)) *Proxy {
 	dialer := &net.Dialer{Timeout: dialTimeout}
-	return &Proxy{
-		record: record,
-		dial:   dialer.DialContext,
-		forwarder: &httputil.ReverseProxy{
-			// The outgoing request is already a copy of the absolute-URL one we got
-			Rewrite: func(*httputil.ProxyRequest) {},
-			// Proxy: nil, so the forwarder never sends traffic back through a proxy
-			Transport: &http.Transport{
-				DialContext:         dialer.DialContext,
-				TLSHandshakeTimeout: dialTimeout,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+	p := &Proxy{record: record, lookup: lookup, dial: dialer.DialContext}
+	p.transport = &http.Transport{
+		// Proxy is nil, so traffic never loops back through a proxy
+		DialContext:         func(ctx context.Context, n, a string) (net.Conn, error) { return p.dial(ctx, n, a) },
+		TLSHandshakeTimeout: dialTimeout,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
 	}
+	p.forwarder = &httputil.ReverseProxy{
+		// The outgoing request is already a copy of the absolute-URL one we got
+		Rewrite:   func(*httputil.ProxyRequest) {},
+		Transport: p.transport,
+	}
+	p.state.Store(&policyState{policy: &Policy{}})
+	return p
+}
+
+// SetPolicy switches to pol. The CA is made again only when the set of hosts
+// changes. Returns the CA now in use, or nil when the policy names no hosts.
+func (p *Proxy) SetPolicy(pol *Policy) (*authority, error) {
+	old := p.state.Load()
+	next := &policyState{policy: pol, ca: old.ca}
+	if hosts := pol.Hosts(); len(hosts) == 0 {
+		next.ca = nil
+	} else if old.ca == nil || !slices.Equal(old.ca.hosts, hosts) {
+		ca, err := newAuthority(hosts)
+		if err != nil {
+			return nil, err
+		}
+		next.ca = ca
+	}
+	p.state.Store(next)
+	return next.ca, nil
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +102,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
+	if host, port, err := net.SplitHostPort(r.Host); err == nil && port == "443" {
+		host = strings.ToLower(host)
+		// SetPolicy makes a CA whenever any rule names a host
+		st := p.state.Load()
+		if rules := st.policy.RulesFor(host); len(rules) > 0 {
+			p.intercept(w, r, host, rules, st.ca)
+			return
+		}
+	}
+
 	e := Entry{Kind: "connect", Host: r.Host}
 	start := time.Now()
 	defer func() { p.log(e, start) }()

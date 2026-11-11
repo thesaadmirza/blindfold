@@ -1,6 +1,6 @@
 # Design: binding secrets to their destinations
 
-Status: draft, 2026-11-10. Nothing here is built yet.
+Status: draft, 2026-11-10, updated 2026-11-11. Milestone 1 is built. Milestone 2 is built for the global policy; project policies and their approval are next.
 
 ## The problem
 
@@ -70,8 +70,7 @@ approve = "writes"                 # never | writes | always
 
 [secrets.OPENAI_API_KEY]
 hosts  = ["api.openai.com"]
-header = "Authorization"
-format = "Bearer {value}"
+header = "Authorization"           # the client sends "Bearer {{OPENAI_API_KEY}}"
 
 [secrets.REGISTRY_PASSWORD]
 hosts      = ["registry.example.com"]
@@ -84,9 +83,9 @@ query = "key"                      # for APIs that only take the key as a query 
 
 Hosts are exact. Wildcards are refused for now, since `*.github.io` or `*.ngrok.app` would hand the secret to anyone who can create a subdomain.
 
-The value goes in one place: the named header, basic auth, or the named query parameter. The proxy never substitutes inside a request body. If it did, an agent could write the secret into a GitLab issue on an allowed host and read it back.
+The value goes in one place: the named header, basic auth, or the named query parameter. The proxy replaces the placeholder inside whatever the client put in that slot, so `Bearer {{OPENAI_API_KEY}}` needs no extra setting. It never substitutes inside a request body. If it did, an agent could write the secret into a GitLab issue on an allowed host and read it back.
 
-A project policy is untrusted until you approve it. It sits in the repo, which means a cloned repo can ship one and the agent can edit one. So the first time the proxy sees a project policy, or sees it change, it shows a native dialog with the diff and stores the hash you approved in `~/.config/blindfold/trusted`. An unapproved policy is ignored, not half-applied. The sandbox also denies writes to `.blindfold.toml` and `~/.config/blindfold/`, so the agent can't quietly edit either one.
+A project policy is untrusted until you approve it. It sits in the repo, which means a cloned repo can ship one and the agent can edit one. So the first time the proxy sees a project policy, or sees it change, it shows a native dialog with the diff and stores the hash you approved in `~/.config/blindfold/trusted`. An unapproved policy is ignored, not half-applied. The sandbox also denies writes to `.blindfold.toml` and `~/.config/blindfold/`, so the agent can't quietly edit either one. Claude's Write and Edit tools run outside the sandbox, so the guard hook refuses them on those paths too, after resolving symlinks and `..`, and refuses a hard link whose other name is inside those folders. The write rule sits only in the egress profile: macOS won't apply a profile with file rules inside another sandbox, and the base profile has to keep working inside Claude Code's.
 
 A secret with no policy can't go through the proxy at all. It can only be used through the old `secret-exec.sh` path, which warns about it.
 
@@ -107,10 +106,10 @@ A secret with no policy can't go through the proxy at all. It can only be used t
 
 ## Local CA
 
-- Generated on first run. The private key lives in the keychain, so the sandbox can't read it.
+- Made in memory when the proxy starts, and made again whenever the set of policy hosts changes. The key is never written anywhere, so there's nothing for the sandbox to read. The cost is that a command already running when the CA changes keeps the old one until it restarts.
 - The CA is only trusted through the environment variables above, inside the sandbox. It is **never** added to the system trust store.
-- Leaf certificates are only issued for hosts named in a trusted policy. A request for any other host never gets a forged certificate.
-- Open question: whether to add X.509 name constraints that limit the CA itself to policy hosts. That's safer, but every policy change would mean a new CA. I lean toward doing it anyway, because regenerating a local CA costs nothing and the user never sees it.
+- X.509 name constraints limit the CA itself to the policy hosts and exclude every IP address, so even a leaked key couldn't vouch for another site.
+- Leaf certificates are only issued for hosts named in the policy. A request for any other host never gets a forged certificate.
 
 ## Approvals
 
@@ -171,6 +170,8 @@ The tests are written as attacks. Each one runs a real command through the guard
 ## Known limits
 
 - Tools that pin certificates won't accept the local CA. They fail rather than leak, but they fail.
+- Go programs on macOS, `gh` among them, ignore `SSL_CERT_FILE` and only trust the system store, so they fail against policy hosts the same way. Fixing that would mean trusting the CA system-wide, which this design rules out.
+- The proxy only offers HTTP/1.1 to clients on intercepted connections. Every client handles it; HTTP/2 can come later.
 - Tools that check a token's format locally (for example, expecting a `glpat-` prefix) may reject `{{GITLAB_TOKEN}}`. A per-secret `placeholder` setting that looks like a real token is one way around this.
 - An allowed host can still be misused. The proxy stops the secret from going anywhere else, but it doesn't stop an agent from making an allowed and unwanted call, like deleting a project. That's what approvals and narrowly scoped tokens are for. This is the limit I'd most want users to understand.
 - Other processes running as the same user, outside the sandbox, can use the proxy too. They still only get injection toward allowed hosts, and they never see the value.
