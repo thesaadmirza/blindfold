@@ -81,7 +81,7 @@ egress_enabled() {
 # exits by itself when its binary is rebuilt, so a dead port means "start it".
 # A proxy without a state file predates policies and is replaced too. The wait
 # is capped at 2s so a slow start fails cleanly inside the hook's 5s timeout;
-# build-proxy.sh launches a new binary once so its first start isn't slow.
+# the install and build scripts launch a new binary once so its first start isn't slow.
 ensure_proxy() {
   local i
   PROXY_PORT=""
@@ -335,7 +335,7 @@ is_private_path() {
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
-EGRESS_SETUP_HINT="Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
+EGRESS_SETUP_HINT="In your own terminal, install it with scripts/install-proxy.sh or build it with scripts/build-proxy.sh. Or unset BLINDFOLD_EGRESS."
 
 check_dependencies() {
   if ! command -v jq &>/dev/null; then

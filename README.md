@@ -77,13 +77,21 @@ On Linux, the guard hook falls back to string matching since Seatbelt is macOS o
 
 By default a sandboxed command can still connect anywhere. Egress lockdown changes that. Sandboxed commands can only reach loopback, so the rest of their traffic has to go through a small local proxy, which logs every destination to `~/.local/state/blindfold/egress.jsonl`. DNS is blocked inside the sandbox, and tools that ignore `HTTPS_PROXY` will fail to connect. Anything that isn't HTTP, like git over ssh or a remote database, can only reach this machine.
 
-To try it, build the proxy (needs Go 1.24+):
+To try it, install the proxy. This downloads the prebuilt binary for your Mac from the release that matches your copy of Blindfold, and checks it against the release's SHA-256 checksums before using it:
+
+```bash
+bash ~/.claude/skills/blindfold/scripts/install-proxy.sh
+```
+
+If [gh](https://cli.github.com) is installed and logged in, the script also checks GitHub's build provenance attestation, which shows the binary was built from that release's tag by this repo's release workflow. Without gh, only the checksums are checked, and those come from the same release as the binary. You can check it yourself later with `gh attestation verify bin/blindfold-proxy -R thesaadmirza/blindfold`.
+
+Or build it from source (needs Go 1.24+):
 
 ```bash
 bash ~/.claude/skills/blindfold/scripts/build-proxy.sh
 ```
 
-Then set `BLINDFOLD_EGRESS=proxy` for Claude Code, for example in the `env` block of `~/.claude/settings.json`. The guard starts the proxy on first use, and restarts it after you rebuild it. If the proxy can't start, commands are refused rather than run without the lockdown.
+Then set `BLINDFOLD_EGRESS=proxy` for Claude Code, for example in the `env` block of `~/.claude/settings.json`. The guard starts the proxy on first use, and restarts it after you reinstall or rebuild it. If the proxy can't start, commands are refused rather than run without the lockdown.
 
 macOS won't apply this profile inside another sandbox. If Claude Code's own sandbox is on, commands under egress lockdown fail to start.
 
@@ -192,6 +200,7 @@ blindfold/
 ├── proxy/              # egress proxy and policy injection (Go)
 ├── scripts/
 │   ├── build-proxy.sh
+│   ├── install-proxy.sh
 │   ├── lib.sh
 │   ├── sandbox.sb
 │   ├── sandbox-egress.sb
