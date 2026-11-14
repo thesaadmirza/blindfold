@@ -81,7 +81,7 @@ egress_enabled() {
 # exits by itself when its binary is rebuilt, so a dead port means "start it".
 # A proxy without a state file predates policies and is replaced too. The wait
 # is capped at 2s so a slow start fails cleanly inside the hook's 5s timeout;
-# build-proxy.sh launches a new binary once so its first start isn't slow.
+# the install and build scripts launch a new binary once so its first start isn't slow.
 ensure_proxy() {
   local i
   PROXY_PORT=""
