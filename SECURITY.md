@@ -8,7 +8,7 @@ Blindfold protects secrets at one of two levels.
 
 **Basic.** Secrets live in the OS keychain. Every command Claude runs is sandboxed so it can't reach the keychain itself. `secret-exec.sh` fills a value into a command, runs it in the sandbox, and redacts the value from the output. This keeps a value out of the conversation when the agent behaves. It doesn't hold up against an agent that's been turned against you, for example by prompt injection, because the command holds the real value and can send it anywhere.
 
-**Egress lockdown** (macOS, `BLINDFOLD_EGRESS=proxy`). Sandboxed commands can't reach the network except through a local proxy. A policy binds each secret to its hosts and to one slot in the request. The command only ever holds a placeholder, and the proxy puts the value in on the way to an allowed host. The agent can copy, encode or post the placeholder anywhere; outside its one slot on its own host, it's just text.
+**Egress lockdown** (macOS, `BLINDFOLD_EGRESS=proxy` in `~/.config/blindfold/settings`). Sandboxed commands can't reach the network except through a local proxy. A policy binds each secret to its hosts and to one slot in the request. The command only ever holds a placeholder, and the proxy puts the value in on the way to an allowed host. The agent can copy, encode or post the placeholder anywhere; outside its one slot on its own host, it's just text.
 
 ## Architecture
 
@@ -49,12 +49,12 @@ Under the basic level, `secret-exec.sh` sits where the proxy is: it reads the ke
 | Component | File | Role |
 |-----------|------|------|
 | **Store** | `secret-store.sh` | Asks for the value in a native OS dialog, stores it in the keychain, registers the name |
-| **Guard** | `secret-guard.sh` | PreToolUse hook. Wraps every Bash command in Seatbelt; with lockdown, points it at the proxy with placeholders and the local CA. Refuses Read of files holding a stored value, Read and Grep of the private folder, and Write or Edit of Blindfold's files and any `.blindfold.toml` |
+| **Guard** | `secret-guard.sh` | PreToolUse hook. Wraps every Bash command in Seatbelt; with lockdown, points it at the proxy with placeholders and the local CA. Refuses Read of files holding a stored value, Read and Grep of the private folder, and Write or Edit of Blindfold's files and any `.blindfold.toml`; under lockdown, also of Claude Code's settings and your shell profiles |
 | **Execute** | `secret-exec.sh` | Basic level: fills `{{PLACEHOLDER}}` values into a command, runs it sandboxed, redacts the output. Under lockdown it refuses secrets that have a policy |
 | **Redact** | `secret-redact.sh` | PostToolUse hook. Warns Claude when Bash output holds a stored value |
 | **Proxy** | `proxy/` (`blindfold-proxy`) | Lockdown: tunnels traffic, intercepts policy hosts with a local CA, fills placeholders, scrubs responses, asks for approval, writes the egress and audit logs |
 | **Approve** | `secret-approve.sh` | Asks you to trust a project's `.blindfold.toml`, in the proxy's dialog or a terminal |
-| **Sandbox** | `sandbox.sb`, `sandbox-egress.sb` | Seatbelt profiles. Both block the keychain. The egress one also blocks the network except loopback, writes to Blindfold's config and code, and reads of the private folder |
+| **Sandbox** | `sandbox.sb`, `sandbox-egress.sb` | Seatbelt profiles. Both block the keychain. The egress one also blocks the network except loopback, writes to Blindfold's config and code, Claude Code's settings and your shell profiles, and reads of the private folder |
 | **Library** | `lib.sh` | Backends, registry, sandbox setup, project tokens, path checks |
 
 ## Threat model
@@ -77,6 +77,7 @@ The attacker is content the agent reads: a README, an issue, a web page, a tool 
 | Widening a policy | Lockdown | The sandbox can't write the policy or Blindfold's files, the guard refuses Write and Edit on them, and a project policy only counts while it matches the exact copy you approved |
 | One project using another's secrets | Lockdown | Each project has a token the sandbox can't read; a request without the right token gets the global policy only |
 | A secret used for something you didn't expect | Lockdown | `approve = "writes"` or `"always"` asks in a dialog first. Deny is the default and is drawn on the right |
+| Switching Blindfold off for later sessions | Lockdown | Lockdown and the migration opt-out are read from `~/.config/blindfold/settings`, which commands and the file tools can't write. Claude Code's settings files, `~/.claude/plugins/` and your shell profiles, where the hooks and Blindfold's environment get set, are protected the same way, along with the folders that hold them |
 | Not knowing what happened | Lockdown | The audit log records every value filled in, echoed back, or refused |
 
 ### What Blindfold does not protect against
@@ -91,8 +92,8 @@ The attacker is content the agent reads: a README, an issue, a web page, a tool 
 | **Placeholders in request bodies** | They're never filled in, but `outside-slot` audit lines only cover headers and URLs. | None needed for safety; it's a gap in the audit log only. |
 | **Project tokens in process environments** | A project's token is in its commands' environment. Another process of yours that can read environments could see it and pass for that project. | Keep untrusted processes off the machine. |
 | **No screen for a dialog** | Approvals and project trust need a GUI. Without one, gated requests are denied. | `secret-approve.sh` works from a terminal for project policies. |
-| **Lockdown off** | Without lockdown, Bash commands aren't kept out of Blindfold's config, and the network is open. | Turn lockdown on before relying on a policy. |
-| **Changing Claude Code's settings** | Lockdown, `BLINDFOLD_EXEC_ANY_SECRET` and the hooks themselves are all switched on through Claude Code's settings and environment. Blindfold doesn't stop the agent editing `~/.claude/settings.json`, a project's `.claude/settings*.json`, or your shell profile, so a determined agent could switch it off for later sessions. | Keep Claude Code's permission prompts on for edits outside the project, and watch for changes to those files. |
+| **Lockdown off** | Without lockdown, Bash commands aren't kept out of Blindfold's config or Claude Code's settings, and the network is open. | Turn lockdown on before relying on a policy. |
+| **Other ways to change how Claude Code starts** | Lockdown keeps the agent out of Claude Code's settings files, `~/.claude/plugins/` and the usual shell profiles (zsh, bash, `~/.profile` and fish). It doesn't know about files those profiles source, like an oh-my-zsh custom folder or scripts in a dotfiles repo, other shells' startup files, or `launchctl setenv`, which sets the environment for apps opened from the Dock. Whatever sets Claude Code's environment can still switch Blindfold off, for example by pointing `BLINDFOLD_CONFIG_DIR` or `CLAUDE_CONFIG_DIR` somewhere else. | Keep what your profile sources somewhere the agent has no reason to touch, and review changes to it. |
 | **Lockdown inside another sandbox** | macOS won't apply a network or file-rule profile inside another sandbox, such as Claude Code's own. | Use one sandbox or the other. |
 | **SIGKILL temp files** | `kill -9` can't be trapped. `secret-exec.sh` temp files may persist. | Created with mode 600 and umask 077. |
 | **`ps` during store** | `security add-generic-password -w VALUE` puts the value on the command line for a moment. | Short window; `security` has no stdin option for `-w`. |
@@ -114,7 +115,7 @@ The attacker is content the agent reads: a README, an issue, a web page, a tool 
 
 ### macOS Seatbelt details
 
-Both profiles deny `com.apple.SecurityServer` at the Mach IPC level. All keychain access goes through that service, regardless of how the command is constructed: Python subprocesses, base64-decoded scripts, temp file execution are all blocked, because the block is below the shell layer. The egress profile adds a network rule that only allows loopback, a write rule for Blindfold's config and code and the project's `.blindfold.toml`, and a read rule for the private folder.
+Both profiles deny `com.apple.SecurityServer` at the Mach IPC level. All keychain access goes through that service, regardless of how the command is constructed: Python subprocesses, base64-decoded scripts, temp file execution are all blocked, because the block is below the shell layer. The egress profile adds a network rule that only allows loopback, a write rule for Blindfold's config and code, the project's `.blindfold.toml`, Claude Code's settings, the shell profiles and the folders above them, and a read rule for the private folder.
 
 ## Known limitations
 

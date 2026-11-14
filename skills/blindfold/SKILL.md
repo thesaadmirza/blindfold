@@ -102,10 +102,11 @@ header  = "PRIVATE-TOKEN"   # or: basic_auth = { username = "..." }, or: query =
 approve = "writes"          # optional: never (default), writes, or always
 ```
 
-Hosts are exact names, with no wildcards. Policies only take effect with egress lockdown on (`BLINDFOLD_EGRESS=proxy` for Claude Code). The README explains how to turn it on.
+Hosts are exact names, with no wildcards. Policies only take effect with egress lockdown on (`BLINDFOLD_EGRESS=proxy` in `~/.config/blindfold/settings`). The README explains how to turn it on.
 
 ## Errors
 
 - **A secret isn't found:** tell the user and offer to store it.
 - **The store dialog was cancelled:** nothing was stored. Say so.
 - **No secret backend is available:** show the setup instructions for their platform.
+- **Claude Code's settings or a shell profile can't be changed:** under lockdown only the user can change those. Tell them what to change and where, and let them do it.

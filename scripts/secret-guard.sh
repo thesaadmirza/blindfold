@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # PreToolUse hook: enforces kernel-level sandbox on Bash commands (macOS Seatbelt),
 # keeps Read away from files that hold a stored secret value, and keeps the
-# file-editing tools away from Blindfold's config and code.
+# file-editing tools away from Blindfold's config and code, and under
+# lockdown from Claude Code's settings and the shell profiles.
 # Exit 0 with JSON = allow (possibly with modified command)
 # Exit 2 = deny
 set -uo pipefail
@@ -37,12 +38,16 @@ if [[ "$TOOL_NAME" == "Read" || "$TOOL_NAME" == "Grep" ]]; then
 fi
 
 # File tools run outside the sandbox, so the sandbox's write rules don't cover
-# them. Refuse edits to Blindfold's config and scripts and to project policies.
+# them. Refuse edits to Blindfold's config and scripts and to project policies,
+# and under lockdown to what could switch Blindfold off.
 if [[ "$TOOL_NAME" != "Bash" && "$TOOL_NAME" != "Read" ]]; then
   FILE_PATH=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<< "$INPUT" 2>/dev/null)
   [[ -n "$FILE_PATH" ]] || exit 0
   is_protected_path "$FILE_PATH" &&
     deny "${FILE_PATH} is Blindfold's own config or code, or a project policy." "Edit it yourself, outside the agent."
+  egress_enabled && is_claude_settings_path "$FILE_PATH" &&
+    deny "${FILE_PATH} is Claude Code's settings or a shell profile, which can turn Blindfold off." \
+      "Egress lockdown keeps the agent out of it. Make this change yourself, outside the agent."
   exit 0
 fi
 

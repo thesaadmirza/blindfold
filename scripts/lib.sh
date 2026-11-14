@@ -8,8 +8,9 @@ ACCOUNT_PREFIX="claude-secret"
 MIN_REDACT_LENGTH=4
 # Default to login keychain. Set BLINDFOLD_KEYCHAIN to use a dedicated keychain.
 BLINDFOLD_KEYCHAIN="${BLINDFOLD_KEYCHAIN:-}"
-# Set BLINDFOLD_EGRESS=proxy to let sandboxed commands reach the network only
-# through the local proxy (macOS only, experimental).
+# BLINDFOLD_EGRESS=proxy lets sandboxed commands reach the network only
+# through the local proxy (macOS only, experimental). The settings file can
+# turn it on too, and the environment can't turn off what the file turned on.
 BLINDFOLD_EGRESS="${BLINDFOLD_EGRESS:-}"
 
 # Callers that already know this directory can set _SV_LIB_DIR first and skip the lookup
@@ -32,12 +33,18 @@ PROJECT_POLICY_FILE=".blindfold.toml"
 EGRESS_LOG="${BLINDFOLD_EGRESS_LOG:-$HOME/.local/state/blindfold/egress.jsonl}"
 # One line per secret filled in, echoed back or refused
 AUDIT_LOG="${BLINDFOLD_AUDIT_LOG:-${EGRESS_LOG%/*}/audit.jsonl}"
+# Blindfold's own switches, as NAME=value lines. It sits in CONFIG_DIR, which
+# the agent can't write under lockdown, so the agent can't turn them off.
+SETTINGS_FILE="${CONFIG_DIR}/settings"
+# Claude Code's config folder
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # Cached values (computed once per script execution)
 _SV_BACKEND=""
 _SV_PROJECT_PATH=""
 _SV_PLATFORM=""
 PROTECTED_DIRS=()
+KEPT_FILES=()
 
 # Returns the keychain path arg for security commands, or empty if using login keychain.
 _keychain_arg() {
@@ -117,6 +124,11 @@ ensure_proxy() {
 # on but can't be set up, so callers refuse rather than run unprotected.
 build_sandbox_argv() {
   SANDBOX_ARGV=() POLICY_NAMES=()
+  if [[ -n "$SETTINGS_ERROR" ]]; then
+    EGRESS_SETUP_ERROR="$SETTINGS_ERROR"
+    EGRESS_SETUP_HINT="Fix it in your own editor, outside the agent. Each line is BLINDFOLD_EGRESS=proxy or BLINDFOLD_EXEC_ANY_SECRET=1."
+    return 1
+  fi
   [[ "$OSTYPE" == darwin* ]] && command -v sandbox-exec &>/dev/null || return 0
 
   if egress_enabled; then
@@ -157,8 +169,18 @@ build_sandbox_argv() {
       done
     fi
     protected_dirs
+    kept_files
+    regex_of "${KEPT_FILES[@]}"
+    KEPT_REGEX="$REGEX"
+    # The project's .claude is only kept once it exists, so commands can still make it
+    PARENTS=()
+    parents_of "${PROTECTED_DIRS[@]}" "${KEPT_FILES[@]}"
+    [[ -d "${PROJECT_DIR}/.claude" ]] && parents_of "${PROJECT_DIR}/.claude/settings.json"
+    regex_of "${PARENTS[@]}"
+    PARENTS_REGEX="$REGEX"
     SANDBOX_ARGV+=(sandbox-exec -D "CONFIG_DIR=${PROTECTED_DIRS[0]}" -D "INSTALL_DIR=${PROTECTED_DIRS[1]}"
       -D "PRIVATE_DIR=${PRIVATE_REAL}" -D "PROJECT_POLICY=${PROJECT_DIR}/${PROJECT_POLICY_FILE}"
+      -D "CLAUDE_SETTINGS=^(${KEPT_REGEX})(/.*)?\$" -D "PARENT_DIRS=^(${PARENTS_REGEX})\$"
       -f "$profile")
   elif [[ -f "${_SV_LIB_DIR}/sandbox.sb" ]]; then
     SANDBOX_ARGV=(sandbox-exec -f "${_SV_LIB_DIR}/sandbox.sb")
@@ -327,6 +349,75 @@ is_protected_path() {
   [[ "${RESOLVED_PATH##*/}" == "$PROJECT_POLICY_FILE" ]]
 }
 
+# Adds to KEPT_FILES the real path of each name in folder $1, and for a
+# symlink, the real path of what it points to as well
+add_kept() {
+  local dir="$1" name
+  shift
+  [[ -L "$dir" ]] && KEPT_FILES+=("$dir")
+  resolve_path "$dir" || return 0
+  dir="$RESOLVED_PATH"
+  for name in "$@"; do
+    KEPT_FILES+=("${dir}/${name}")
+    [[ -L "${dir}/${name}" ]] && resolve_path "${dir}/${name}" && KEPT_FILES+=("$RESOLVED_PATH")
+  done
+}
+
+# Sets KEPT_FILES to Claude Code's user settings, its plugins folder (which
+# says what's installed and where it came from) and the shell profiles, once
+# per run
+kept_files() {
+  [[ ${#KEPT_FILES[@]} -gt 0 ]] && return 0
+  local zsh=(.zshenv .zprofile .zshrc .zlogin)
+  add_kept "$CLAUDE_DIR" settings.json settings.local.json plugins
+  add_kept "$HOME" "${zsh[@]}" .bash_profile .bash_login .bashrc .profile
+  add_kept "$HOME/.config/fish" config.fish
+  [[ -n "${ZDOTDIR:-}" ]] && add_kept "$ZDOTDIR" "${zsh[@]}"
+}
+
+# True for a file named like a project's Claude Code settings, anywhere
+is_project_settings() {
+  [[ "$1" == */.claude/settings.json || "$1" == */.claude/settings.local.json ]]
+}
+
+# True for Claude Code's settings, its plugins folder and the shell profiles.
+# The guard only refuses these under lockdown: without it, Bash can write them
+# anyway.
+is_claude_settings_path() {
+  is_project_settings "$1" && return 0
+  kept_files
+  path_is_inside "$1" "${KEPT_FILES[@]}" && return 0
+  is_project_settings "$RESOLVED_PATH"
+}
+
+# Adds to PARENTS every folder above the given paths, once each, so the
+# sandbox can keep them from being renamed or removed with what's inside.
+# Plain bash, since this runs on every command.
+parents_of() {
+  local p seen
+  for p in "$@"; do
+    while p="${p%/*}"; [[ -n "$p" ]]; do
+      # A folder seen before has had its own parents added already
+      for seen in ${PARENTS[@]+"${PARENTS[@]}"}; do
+        [[ "$seen" == "$p" ]] && continue 3
+      done
+      PARENTS+=("$p")
+    done
+  done
+}
+
+# Sets REGEX to one alternation that matches each given path literally
+regex_of() {
+  local p c
+  REGEX=""
+  for p in "$@"; do
+    for c in '\' . '[' ']' '*' '^' '$' + '?' '(' ')' '{' '}' '|'; do
+      p="${p//"$c"/\\$c}"
+    done
+    REGEX+="${REGEX:+|}${p}"
+  done
+}
+
 # True for the private folder, where reading a project token would let the
 # agent pass for that project
 is_private_path() {
@@ -334,8 +425,30 @@ is_private_path() {
   path_is_inside "$1" "$PRIVATE_REAL"
 }
 
+# Reads SETTINGS_FILE. Sets BLINDFOLD_EGRESS=proxy when it turns lockdown on,
+# and EXEC_ANY_SECRET when it turns secret-exec.sh's refusal off. A file it
+# can't make sense of turns lockdown on and sets SETTINGS_ERROR, so commands
+# are refused until it's fixed rather than run with a guess.
+read_settings() {
+  local line
+  EXEC_ANY_SECRET="" SETTINGS_ERROR=""
+  [[ -f "$SETTINGS_FILE" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    case "$line" in
+      BLINDFOLD_EGRESS=proxy) BLINDFOLD_EGRESS=proxy ;;
+      BLINDFOLD_EGRESS=) ;;
+      BLINDFOLD_EXEC_ANY_SECRET=1) EXEC_ANY_SECRET=1 ;;
+      BLINDFOLD_EXEC_ANY_SECRET=0 | BLINDFOLD_EXEC_ANY_SECRET=) ;;
+      *) SETTINGS_ERROR="Line '${line}' in ${SETTINGS_FILE} is not a setting Blindfold knows." ;;
+    esac
+  done <"$SETTINGS_FILE"
+  [[ -z "$SETTINGS_ERROR" ]] || BLINDFOLD_EGRESS=proxy
+}
+read_settings
+
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
-EGRESS_SETUP_HINT="In your own terminal, install it with scripts/install-proxy.sh or build it with scripts/build-proxy.sh. Or unset BLINDFOLD_EGRESS."
+EGRESS_SETUP_HINT="In your own terminal, install it with scripts/install-proxy.sh or build it with scripts/build-proxy.sh. Or turn lockdown off."
 
 check_dependencies() {
   if ! command -v jq &>/dev/null; then

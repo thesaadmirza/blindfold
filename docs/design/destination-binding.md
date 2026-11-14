@@ -140,7 +140,7 @@ Query strings are left out of `path`, because they can carry data. Denied attemp
 ## What stays the same
 
 - Secrets are still stored in the keychain through the native dialog. The registry is unchanged.
-- `secret-exec.sh` still works for non-HTTP uses. When a secret has a policy, `secret-exec.sh` refuses to substitute it and points to the proxy path instead. A setting can turn that refusal off while people migrate. As built, the setting is `BLINDFOLD_EXEC_ANY_SECRET=1` in Claude Code's environment, and the refusal applies only under lockdown, since without it there's no proxy to point to. A command that sets it in front of the script loses its exemption and runs in the sandbox, but that only covers one route. An agent that can edit Claude Code's settings or the user's shell profile can set it, and could switch lockdown off the same way. Protecting those files is a separate piece of work.
+- `secret-exec.sh` still works for non-HTTP uses. When a secret has a policy, `secret-exec.sh` refuses to substitute it and points to the proxy path instead. A setting can turn that refusal off while people migrate. As built, the setting is `BLINDFOLD_EXEC_ANY_SECRET=1` in `~/.config/blindfold/settings`, and the refusal applies only under lockdown, since without it there's no proxy to point to. Blindfold reads it from that file and nowhere else. The file sits in the config folder the agent can't write, and lockdown can be turned on there too. Under lockdown, Claude Code's settings and the shell profiles are also out of the agent's reach, since they switch the hooks on and set Blindfold's environment. SECURITY.md lists what's still outside that.
 - The guard hook still does the wrapping. Later, a `blindfold run -- <agent>` command could wrap the whole agent process instead, so it covers every tool and works with agents other than Claude Code.
 
 ## Implementation
@@ -167,6 +167,7 @@ The tests are written as attacks. Each one runs a real command through the guard
 - `Host` header that doesn't match the CONNECT target.
 - An allowed host whose response echoes the token back.
 - Writing to `.blindfold.toml` or `~/.config/blindfold/` from inside the sandbox.
+- Writing Claude Code's settings or a shell profile from inside the sandbox, or moving the folder that holds them.
 - A project policy that adds a new host without being approved.
 - A tool that ignores `HTTPS_PROXY` and tries to connect directly.
 - DNS lookups from inside the sandbox.

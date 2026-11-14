@@ -255,3 +255,74 @@ class TestBlindfoldFilesAreProtected:
 
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert result.stdout.strip() == ""
+
+
+class TestClaudeSettingsUnderLockdown:
+    """Claude Code's settings and the shell profiles switch Blindfold on, so
+    under lockdown the file tools may not change them. HOME points at a
+    folder of the test's own, so nothing real is looked at."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.home = tmp_path / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        self.env = os.environ.copy()
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+        self.env.pop("ZDOTDIR", None)
+        self.env.update({
+            "HOME": str(self.home),
+            "BLINDFOLD_CONFIG_DIR": str(tmp_path / "config"),
+            "BLINDFOLD_EGRESS": "proxy",
+        })
+        self.dir = tmp_path
+
+    def _edit(self, path, tool="Edit"):
+        return run_guard(build_file_tool_input(tool, str(path)), self.env)
+
+    @pytest.mark.parametrize("name", [
+        ".claude/settings.json", ".claude/settings.local.json", ".claude/plugins/installed_plugins.json",
+        ".zshrc", ".zshenv", ".zprofile", ".bash_profile", ".bashrc", ".profile", ".config/fish/config.fish",
+    ])
+    def test_user_settings_and_profiles_are_refused(self, name):
+        result = self._edit(self.home / name)
+
+        assert result.returncode == 2, f"stderr={result.stderr!r}"
+        assert "Make this change yourself" in result.stderr
+
+    @pytest.mark.parametrize("name", [".claude/settings.json", ".claude/settings.local.json"])
+    def test_any_project_settings_are_refused(self, name):
+        assert self._edit(self.dir / "some-project" / name, "Write").returncode == 2
+
+    def test_symlinked_profile_is_refused_at_its_target(self):
+        dotfiles = self.dir / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "zshrc").write_text("")
+        (self.home / ".zshrc").symlink_to(dotfiles / "zshrc")
+
+        assert self._edit(dotfiles / "zshrc").returncode == 2
+
+    def test_claude_config_dir_is_followed(self):
+        moved = self.dir / "claude-config"
+        self.env["CLAUDE_CONFIG_DIR"] = str(moved)
+
+        assert self._edit(moved / "settings.json").returncode == 2
+
+    def test_zdotdir_profiles_are_refused(self):
+        self.env["ZDOTDIR"] = str(self.dir / "zsh")
+
+        assert self._edit(self.dir / "zsh" / ".zshrc").returncode == 2
+
+    @pytest.mark.parametrize("name", [
+        ".claude/CLAUDE.md", ".claude/projects/p/memory/note.md", "some-project/.claude/commands/run.md", "notes.zshrc",
+    ])
+    def test_other_files_stay_editable(self, name):
+        result = self._edit(self.home / name)
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+
+    def test_settings_stay_editable_without_lockdown(self):
+        # Bash can write them anyway without lockdown, so refusing here would
+        # only get in the way
+        self.env.pop("BLINDFOLD_EGRESS")
+
+        assert self._edit(self.home / ".claude" / "settings.json").returncode == 0
