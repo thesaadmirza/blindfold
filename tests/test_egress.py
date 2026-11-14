@@ -140,6 +140,7 @@ class TestEgressWiring:
         result = run_guard(build_guard_input("echo hi"), egress_env)
 
         assert result.returncode == 2
+        assert "install-proxy.sh" in result.stderr
         assert "build-proxy.sh" in result.stderr
 
     def test_egress_is_off_by_default(self, egress_env):

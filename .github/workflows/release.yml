@@ -1,0 +1,68 @@
+name: release
+
+# Builds the egress proxy for macOS when a version tag is pushed, and puts the
+# binaries, their SHA-256 checksums and a build provenance attestation on a
+# draft release. Publish the draft once it looks right.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    needs: test
+    runs-on: macos-latest
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the attestation
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag matches plugin.json
+        run: |
+          want="v$(jq -r .version .claude-plugin/plugin.json)"
+          if [[ "$GITHUB_REF_NAME" != "$want" ]]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match the version in plugin.json ($want)."
+            exit 1
+          fi
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: proxy/go.mod
+          cache: false
+
+      - name: Build
+        working-directory: proxy
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p ../dist
+          for arch in arm64 amd64; do
+            GOOS=darwin GOARCH="$arch" go build -trimpath -o "../dist/blindfold-proxy-darwin-$arch" .
+          done
+          "../dist/blindfold-proxy-darwin-$(go env GOARCH)" -check /dev/null
+          cd ../dist
+          shasum -a 256 blindfold-proxy-darwin-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/blindfold-proxy-darwin-*
+
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          -R "$GITHUB_REPOSITORY" --draft --verify-tag
+          --title "$GITHUB_REF_NAME" --generate-notes
