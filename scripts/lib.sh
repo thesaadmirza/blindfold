@@ -335,7 +335,7 @@ is_private_path() {
 }
 
 EGRESS_SETUP_ERROR="Egress lockdown is on, but the proxy did not start."
-EGRESS_SETUP_HINT="Build it with scripts/build-proxy.sh in your own terminal, or unset BLINDFOLD_EGRESS."
+EGRESS_SETUP_HINT="In your own terminal, install it with scripts/install-proxy.sh or build it with scripts/build-proxy.sh. Or unset BLINDFOLD_EGRESS."
 
 check_dependencies() {
   if ! command -v jq &>/dev/null; then
