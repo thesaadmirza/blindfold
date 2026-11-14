@@ -80,6 +80,15 @@ def _write_policy(env, body):
     path.write_text(body)
 
 
+def _store_test_secret(env, keychain, name="BFTEST_TOKEN", value="bftest-real-value"):
+    """Put a global test secret in a throwaway keychain and register its name,
+    the way secret-store.sh would"""
+    subprocess.run(["security", "add-generic-password", "-a", f"claude-secret:global:{name}",
+                    "-s", "claude-secrets", "-w", value, str(keychain)], check=True)
+    env["BLINDFOLD_KEYCHAIN"] = str(keychain)
+    run_script("secret-store.sh", ["--register-only", name], env=env)
+
+
 def _env_words(wrapped):
     """NAME=value words the guard sets before sandbox-exec"""
     words = shlex.split(wrapped)
@@ -168,6 +177,26 @@ class TestEgressWiring:
             assert f"{var}={bundle}" in wrapped
         assert "BFTEST_TOKEN={{BFTEST_TOKEN}}" in wrapped
         assert bundle.read_text().count("BEGIN CERTIFICATE") >= 2, "bundle is missing the roots or the CA"
+
+    def test_secret_exec_refuses_a_secret_with_a_policy(self, egress_env):
+        _write_policy(egress_env, POLICY)
+
+        result = run_script("secret-exec.sh", ['curl -H "X-Test-Token: {{BFTEST_TOKEN}}" https://example.com/'],
+                            env=egress_env)
+
+        assert result.returncode == 1
+        assert "BFTEST_TOKEN has a policy" in result.stderr
+        assert "{{BFTEST_TOKEN}}" in result.stderr, "the refusal should show the agent what to run instead"
+
+    def test_agent_cannot_turn_the_refusal_off_itself(self, egress_env):
+        # Only the exact form of a call is exempt from the sandbox; with a
+        # variable set in front, secret-exec runs sandboxed, away from the keychain
+        exec_path = SCRIPTS_DIR / "secret-exec.sh"
+        cmd = f"BLINDFOLD_EXEC_ANY_SECRET=1 bash {exec_path} 'echo {{{{BFTEST_TOKEN}}}}'"
+
+        wrapped = wrap_through_guard(cmd, egress_env)
+
+        assert "sandbox-exec" in wrapped
 
     def test_a_policy_secret_cannot_shadow_what_the_guard_sets(self, egress_env):
         # The guard sets these itself, so proxy/policy.go must refuse them as names
@@ -430,6 +459,20 @@ class TestEgressRuntime:
 
         assert result.returncode != 0, "secret-exec let a direct connection out"
 
+    @pytest.mark.parametrize("opt_out", [False, True], ids=["no-policy", "user-opted-out"])
+    def test_secret_exec_still_works_where_the_proxy_does_not_apply(self, egress_env, temp_keychain, opt_out):
+        # A secret with no policy, or one the user has opted out for while
+        # migrating, is still filled in and redacted the old way
+        _store_test_secret(egress_env, temp_keychain)
+        if opt_out:
+            _write_policy(egress_env, POLICY)
+            egress_env["BLINDFOLD_EXEC_ANY_SECRET"] = "1"
+
+        result = run_script("secret-exec.sh", ["echo got {{BFTEST_TOKEN}}"], env=egress_env)
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert result.stdout.strip() == "got [REDACTED:BFTEST_TOKEN]"
+
     def test_commands_cannot_write_blindfold_files(self, egress_env, tmp_path):
         policy = _config_dir(egress_env) / "policy.toml"
         script = SCRIPTS_DIR / ".write-probe"
@@ -483,9 +526,7 @@ class TestEgressRuntime:
     @pytest.mark.skipif(not _online(), reason="needs internet access")
     @pytest.mark.parametrize("header", ["{{BFTEST_TOKEN}}", "$BFTEST_TOKEN"], ids=["placeholder", "env-var"])
     def test_placeholder_is_filled_from_the_keychain(self, egress_env, temp_keychain, header):
-        subprocess.run(["security", "add-generic-password", "-a", "claude-secret:global:BFTEST_TOKEN",
-                        "-s", "claude-secrets", "-w", "bftest-real-value", str(temp_keychain)], check=True)
-        egress_env["BLINDFOLD_KEYCHAIN"] = str(temp_keychain)
+        _store_test_secret(egress_env, temp_keychain)
         _write_policy(egress_env, POLICY)
         cmd = CURL_EXAMPLE.format(extra=f'-H "X-Test-Token: {header}"')
 

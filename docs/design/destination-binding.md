@@ -1,6 +1,6 @@
 # Design: binding secrets to their destinations
 
-Status: draft, 2026-11-10, updated 2026-11-11. Milestones 1 to 4 are built.
+Status: built, 2026-11-11. All five milestones are in. This document is kept as the record of why it works the way it does.
 
 ## The problem
 
@@ -140,7 +140,7 @@ Query strings are left out of `path`, because they can carry data. Denied attemp
 ## What stays the same
 
 - Secrets are still stored in the keychain through the native dialog. The registry is unchanged.
-- `secret-exec.sh` still works for non-HTTP uses. When a secret has a policy, `secret-exec.sh` refuses to substitute it and points to the proxy path instead. A setting can turn that refusal off while people migrate.
+- `secret-exec.sh` still works for non-HTTP uses. When a secret has a policy, `secret-exec.sh` refuses to substitute it and points to the proxy path instead. A setting can turn that refusal off while people migrate. As built, the setting is `BLINDFOLD_EXEC_ANY_SECRET=1` in Claude Code's environment, and the refusal applies only under lockdown, since without it there's no proxy to point to. A command that sets it in front of the script loses its exemption and runs in the sandbox, but that only covers one route. An agent that can edit Claude Code's settings or the user's shell profile can set it, and could switch lockdown off the same way. Protecting those files is a separate piece of work.
 - The guard hook still does the wrapping. Later, a `blindfold run -- <agent>` command could wrap the whole agent process instead, so it covers every tool and works with agents other than Claude Code.
 
 ## Implementation
